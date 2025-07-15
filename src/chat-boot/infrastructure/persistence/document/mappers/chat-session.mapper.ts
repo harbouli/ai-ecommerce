@@ -5,11 +5,7 @@ import { MessageMapper } from './message.mapper';
 import { MessageDocument } from '../entities/message.schema';
 
 export class ChatSessionMapper {
-  static toDomain(document: ChatSessionDocument): ChatSession | null {
-    if (!document) {
-      return null;
-    }
-
+  static toDomain(document: ChatSessionDocument): ChatSession {
     return new ChatSession({
       id: document._id.toString(),
       title: document.title,

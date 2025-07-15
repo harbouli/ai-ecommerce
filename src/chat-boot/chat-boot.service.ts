@@ -13,7 +13,7 @@ import { ProductRecommendationDto } from './dto/product-recommendation.dto';
 import { KnowledgeGraphService } from './infrastructure/services/knowledge-graph.service';
 import { Neo4jGraphService } from './infrastructure/services/neo4j-graph.service';
 import { ChatSession } from './domain/chat-session';
-import { Message } from './domain/message';
+import { Message } from './domain/chat-session';
 import { ChatRepository } from './infrastructure/persistence/chat.repository';
 
 export interface PaginationOptions {
