@@ -70,6 +70,25 @@ class EnvironmentVariablesValidator {
   @IsString()
   @IsOptional()
   DATABASE_CERT: string;
+  @IsString()
+  @IsOptional()
+  WEAVIATE_HOST: string;
+
+  @IsInt()
+  @IsOptional()
+  WEAVIATE_PORT: number;
+
+  @IsInt()
+  @IsOptional()
+  WEAVIATE_GRPC_PORT: number;
+
+  @IsString()
+  @IsOptional()
+  WEAVIATE_SCHEME: string;
+
+  @IsString()
+  @IsOptional()
+  WEAVIATE_API_KEY: string;
 }
 
 export default registerAs<DatabaseConfig>('database', () => {
@@ -95,5 +114,17 @@ export default registerAs<DatabaseConfig>('database', () => {
     ca: process.env.DATABASE_CA,
     key: process.env.DATABASE_KEY,
     cert: process.env.DATABASE_CERT,
+    isVectorDatabase: process.env.DATABASE_TYPE === 'weaviate',
+    weaviate: {
+      host: process.env.WEAVIATE_HOST || 'localhost',
+      port: process.env.WEAVIATE_PORT
+        ? parseInt(process.env.WEAVIATE_PORT, 10)
+        : 8080,
+      grpcPort: process.env.WEAVIATE_GRPC_PORT
+        ? parseInt(process.env.WEAVIATE_GRPC_PORT, 10)
+        : 50051,
+      scheme: process.env.WEAVIATE_SCHEME || 'http',
+      apiKey: process.env.WEAVIATE_API_KEY,
+    },
   };
 });

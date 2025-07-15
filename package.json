@@ -64,7 +64,8 @@
     "rimraf": "6.0.1",
     "rxjs": "7.8.2",
     "source-map-support": "0.5.21",
-    "swagger-ui-express": "5.0.1"
+    "swagger-ui-express": "5.0.1",
+    "weaviate-ts-client": "^2.2.0"
   },
   "devDependencies": {
     "@commitlint/cli": "19.8.1",

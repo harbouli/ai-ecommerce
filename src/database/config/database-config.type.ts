@@ -14,4 +14,11 @@ export type DatabaseConfig = {
   ca?: string;
   key?: string;
   cert?: string;
+  weaviate?: {
+    host: string;
+    port: number;
+    grpcPort: number;
+    scheme: string;
+    apiKey?: string;
+  };
 };
