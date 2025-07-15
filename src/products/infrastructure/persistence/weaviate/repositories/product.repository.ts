@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-unused-vars */
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { WeaviateService } from '../../../../../database/weaviate/weaviate.service';
 import { ProductRepository } from '../../product.repository';
 import { Product } from '../../../../domain/product';
@@ -9,14 +9,19 @@ import { IPaginationOptions } from '../../../../../utils/types/pagination-option
 import { WeaviateClient } from 'weaviate-ts-client';
 
 @Injectable()
-export class ProductWeaviateRepository implements ProductRepository {
+export class ProductWeaviateRepository
+  implements ProductRepository, OnModuleInit
+{
   private readonly logger = new Logger(ProductWeaviateRepository.name);
   private readonly className = 'Product';
   private client: WeaviateClient;
 
-  constructor(private readonly weaviateService: WeaviateService) {
-    this.client = this.weaviateService.getClient();
-    void this.initializeSchema();
+  constructor(private readonly weaviateService: WeaviateService) {}
+
+  async onModuleInit() {
+    // Initialize the client when the module is ready
+    this.client = await this.weaviateService.getClient();
+    await this.initializeSchema();
   }
 
   private async initializeSchema(): Promise<void> {
@@ -40,14 +45,8 @@ export class ProductWeaviateRepository implements ProductRepository {
   private async createProductSchema(): Promise<void> {
     const classDefinition = {
       class: this.className,
-      description: 'Product information for e-commerce platform',
+      description: 'Product information for e-commerce',
       vectorizer: 'text2vec-transformers',
-      moduleConfig: {
-        'text2vec-transformers': {
-          poolingStrategy: 'masked_mean',
-          vectorizeClassName: false,
-        },
-      },
       properties: [
         {
           name: 'name',
@@ -75,6 +74,12 @@ export class ProductWeaviateRepository implements ProductRepository {
           name: 'slug',
           dataType: ['text'],
           description: 'Product URL slug',
+          moduleConfig: {
+            'text2vec-transformers': {
+              skip: true,
+              vectorizePropertyName: false,
+            },
+          },
         },
         {
           name: 'price',
@@ -105,6 +110,12 @@ export class ProductWeaviateRepository implements ProductRepository {
           name: 'dimensions',
           dataType: ['text'],
           description: 'Product dimensions',
+          moduleConfig: {
+            'text2vec-transformers': {
+              skip: true,
+              vectorizePropertyName: false,
+            },
+          },
         },
         {
           name: 'color',
@@ -141,7 +152,7 @@ export class ProductWeaviateRepository implements ProductRepository {
         {
           name: 'isDigital',
           dataType: ['boolean'],
-          description: 'Product digital status',
+          description: 'Product digital type',
         },
         {
           name: 'metaTitle',
@@ -191,9 +202,18 @@ export class ProductWeaviateRepository implements ProductRepository {
     await this.client.schema.classCreator().withClass(classDefinition).do();
   }
 
+  // Helper method to ensure client is ready
+  private async ensureClientReady(): Promise<void> {
+    if (!this.client) {
+      this.client = await this.weaviateService.getClient();
+    }
+  }
+
   async create(
     data: Omit<Product, 'id' | 'createdAt' | 'updatedAt'>,
   ): Promise<Product> {
+    await this.ensureClientReady();
+
     try {
       const persistenceModel = ProductWeaviateMapper.toPersistence({
         ...data,
@@ -228,6 +248,8 @@ export class ProductWeaviateRepository implements ProductRepository {
   }: {
     paginationOptions: IPaginationOptions;
   }): Promise<Product[]> {
+    await this.ensureClientReady();
+
     try {
       const result = await this.client.graphql
         .get()
@@ -247,12 +269,14 @@ export class ProductWeaviateRepository implements ProductRepository {
         }),
       );
     } catch (error) {
-      this.logger.error('Error finding products in Weaviate:', error);
+      this.logger.error('Error finding products by IDs in Weaviate:', error);
       throw error;
     }
   }
 
   async findById(id: Product['id']): Promise<NullableType<Product>> {
+    await this.ensureClientReady();
+
     try {
       const result = await this.client.graphql
         .get()
@@ -263,7 +287,7 @@ export class ProductWeaviateRepository implements ProductRepository {
         .withWhere({
           path: ['id'],
           operator: 'Equal',
-          valueText: id,
+          valueString: id,
         })
         .do();
 
@@ -277,15 +301,14 @@ export class ProductWeaviateRepository implements ProductRepository {
         id: products[0]._additional.id,
       });
     } catch (error) {
-      this.logger.error(
-        `Error finding product by ID ${id} in Weaviate:`,
-        error,
-      );
-      return null;
+      this.logger.error(`Error finding product ${id} in Weaviate:`, error);
+      throw error;
     }
   }
 
   async findByIds(ids: Product['id'][]): Promise<Product[]> {
+    await this.ensureClientReady();
+
     try {
       const result = await this.client.graphql
         .get()
@@ -298,7 +321,7 @@ export class ProductWeaviateRepository implements ProductRepository {
           operands: ids.map((id) => ({
             path: ['id'],
             operator: 'Equal',
-            valueText: id,
+            valueString: id,
           })),
         })
         .do();
@@ -320,6 +343,8 @@ export class ProductWeaviateRepository implements ProductRepository {
     id: Product['id'],
     payload: Partial<Product>,
   ): Promise<NullableType<Product>> {
+    await this.ensureClientReady();
+
     try {
       // First check if the object exists
       const existingProduct = await this.findById(id);
@@ -360,6 +385,8 @@ export class ProductWeaviateRepository implements ProductRepository {
   }
 
   async remove(id: Product['id']): Promise<void> {
+    await this.ensureClientReady();
+
     try {
       await this.client.data
         .deleter()
@@ -380,6 +407,8 @@ export class ProductWeaviateRepository implements ProductRepository {
     limit: number = 10,
     threshold: number = 0.7,
   ): Promise<Product[]> {
+    await this.ensureClientReady();
+
     try {
       const result = await this.client.graphql
         .get()
@@ -395,39 +424,8 @@ export class ProductWeaviateRepository implements ProductRepository {
         .do();
 
       const products = result.data?.Get?.[this.className] || [];
-      return products.map((product: any) =>
-        ProductWeaviateMapper.toDomain({
-          ...product,
-          id: product._additional.id,
-        }),
-      );
-    } catch (error) {
-      this.logger.error('Error performing semantic search in Weaviate:', error);
-      throw error;
-    }
-  }
-
-  async findSimilarProducts(
-    productId: string,
-    limit: number = 5,
-  ): Promise<Product[]> {
-    try {
-      const result = await this.client.graphql
-        .get()
-        .withClassName(this.className)
-        .withFields(
-          '_additional { id certainty } name description slug price costPrice salePrice stock weight dimensions color size isActive isFeatured isDigital metaTitle metaDescription publishedAt expiresAt createdAt updatedAt',
-        )
-        .withNearObject({
-          id: productId,
-        })
-        .withLimit(limit + 1) // +1 to exclude the source product
-        .do();
-
-      const products = result.data?.Get?.[this.className] || [];
       return products
-        .filter((product: any) => product._additional.id !== productId)
-        .slice(0, limit)
+        .filter((product: any) => product._additional.certainty >= threshold)
         .map((product: any) =>
           ProductWeaviateMapper.toDomain({
             ...product,
@@ -435,7 +433,7 @@ export class ProductWeaviateRepository implements ProductRepository {
           }),
         );
     } catch (error) {
-      this.logger.error('Error finding similar products in Weaviate:', error);
+      this.logger.error('Error performing semantic search:', error);
       throw error;
     }
   }

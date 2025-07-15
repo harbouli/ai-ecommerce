@@ -172,10 +172,7 @@ export class HybridProductRepository implements ProductRepository {
   ): Promise<Product[]> {
     try {
       // Get similar products from Weaviate
-      const similarProducts = await this.weaviateRepository.findSimilarProducts(
-        productId,
-        limit,
-      );
+      const similarProducts = await this.findSimilarProducts(productId, limit);
 
       // Optionally fetch fresh data from MongoDB for consistency
       const productIds = similarProducts.map((p) => p.id);

@@ -27,6 +27,7 @@ import {
     // Weaviate repository
     ProductWeaviateRepository,
     // Hybrid repository that uses both
+    HybridProductRepository,
     {
       provide: ProductRepository,
       useClass: HybridProductRepository,
@@ -36,6 +37,7 @@ import {
     ProductRepository,
     ProductDocumentRepository,
     ProductWeaviateRepository,
+    HybridProductRepository,
   ],
 })
 export class HybridProductPersistenceModule {}
