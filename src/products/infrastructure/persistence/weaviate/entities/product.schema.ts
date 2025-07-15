@@ -8,7 +8,7 @@ export class ProductWeaviateSchema extends EntityWeaviateHelper {
   price: number;
   costPrice?: number | null;
   salePrice?: number | null;
-  stock: number;
+  stock?: number | null;
   weight?: number | null;
   dimensions?: string | null;
   color?: string | null;

@@ -50,7 +50,7 @@ export class Product {
     type: Number,
     example: 100,
   })
-  stock: number;
+  stock?: number | null;
 
   @ApiProperty({
     type: Number,
