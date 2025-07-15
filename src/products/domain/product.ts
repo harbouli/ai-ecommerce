@@ -133,4 +133,25 @@ export class Product {
 
   @ApiProperty()
   updatedAt: Date;
+
+  @ApiProperty({
+    type: String,
+    example: 'Smartphones',
+    nullable: true,
+  })
+  category?: string | null;
+
+  @ApiProperty({
+    type: String,
+    example: 'Apple',
+    nullable: true,
+  })
+  brand?: string | null;
+
+  @ApiProperty({
+    type: [String],
+    example: ['electronics', 'mobile', 'apple'],
+    nullable: true,
+  })
+  tags?: string[];
 }

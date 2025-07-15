@@ -34,7 +34,7 @@ services:
   #   ports:
   #     - 6379:6379
 
-  # Weaviate Vector Database
+  # Weaviate Vector Database with text2vec-transformers
   weaviate:
     command:
       - --host
@@ -46,18 +46,20 @@ services:
     image: cr.weaviate.io/semitechnologies/weaviate:1.25.0
     restart: always
     ports:
-      - ${WEAVIATE_PORT}:8080
-      - ${WEAVIATE_GRPC_PORT}:50051
+      - "8080:8080"
+      - "50051:50051"
     environment:
       QUERY_DEFAULTS_LIMIT: 25
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
       PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
-      DEFAULT_VECTORIZER_MODULE: 'none'
-      ENABLE_MODULES: ''
+      DEFAULT_VECTORIZER_MODULE: 'text2vec-transformers'
+      ENABLE_MODULES: 'text2vec-transformers'
+      TRANSFORMERS_INFERENCE_API: 'http://t2v-transformers:8080'
       CLUSTER_HOSTNAME: 'node1'
-      WEAVIATE_HOST: 'weaviate'
     volumes:
       - ai-ecommerce-weaviate-data:/var/lib/weaviate
+    depends_on:
+      - t2v-transformers
     healthcheck:
       test:
         [
@@ -68,10 +70,51 @@ services:
           '--spider',
           'http://localhost:8080/v1/.well-known/live',
         ]
-      interval: 10s
+      interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 20s
+      start_period: 90s
+
+  # Text2vec-transformers inference service
+  t2v-transformers:
+    image: cr.weaviate.io/semitechnologies/transformers-inference:sentence-transformers-all-MiniLM-L6-v2
+    restart: always
+    environment:
+      ENABLE_CUDA: '0'  # Set to '1' if you have NVIDIA GPU support
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/.well-known/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Neo4j Graph Database
+  neo4j:
+    image: neo4j:5.24-enterprise
+    restart: always
+    ports:
+      - "7474:7474"  # HTTP
+      - "7687:7687"  # Bolt
+    environment:
+      NEO4J_AUTH: neo4j/password
+      NEO4J_ACCEPT_LICENSE_AGREEMENT: 'yes'
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_apoc_export_file_enabled: 'true'
+      NEO4J_apoc_import_file_enabled: 'true'
+      NEO4J_apoc_import_file_use__neo4j__config: 'true'
+      NEO4J_HEAP_MEMORY: 512M
+      NEO4J_CACHE_MEMORY: 256M
+    volumes:
+      - ai-ecommerce-neo4j-data:/data
+      - ai-ecommerce-neo4j-plugins:/plugins
+    healthcheck:
+      test: ["CMD", "cypher-shell", "--username", "neo4j", "--password", "password", "RETURN 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
   api:
     build:
@@ -79,7 +122,13 @@ services:
       dockerfile: document.Dockerfile
     ports:
       - ${APP_PORT}:${APP_PORT}
+    depends_on:
+      - mongo
+      - weaviate
+      - neo4j
 
 volumes:
   ai-ecommerce-mongo-db:
   ai-ecommerce-weaviate-data:
+  ai-ecommerce-neo4j-data:
+  ai-ecommerce-neo4j-plugins:

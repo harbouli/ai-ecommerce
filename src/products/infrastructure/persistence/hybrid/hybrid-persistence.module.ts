@@ -1,11 +1,13 @@
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 import { WeaviateModule } from '../../../../database/weaviate/weaviate.module';
+import { Neo4jModule } from '../../../../database/neo4j/neo4j.module';
 
 import { ProductRepository } from '../product.repository';
 import { HybridProductRepository } from './hybrid-product.repository';
 import { ProductDocumentRepository } from '../document/repositories/product.repository';
 import { ProductWeaviateRepository } from '../weaviate/repositories/product.repository';
+import { ProductGraphRepository } from '../graph/repositories/product-graph.repository';
 
 import {
   ProductSchema,
@@ -20,14 +22,16 @@ import {
     ]),
     // Weaviate setup
     WeaviateModule,
+    // Neo4j setup
+    Neo4jModule,
   ],
   providers: [
-    // MongoDB repository
+    // Individual repository implementations
     ProductDocumentRepository,
-    // Weaviate repository
     ProductWeaviateRepository,
-    // Hybrid repository that uses both
-    HybridProductRepository,
+    ProductGraphRepository,
+
+    // Hybrid repository that uses all three databases
     {
       provide: ProductRepository,
       useClass: HybridProductRepository,
@@ -37,7 +41,7 @@ import {
     ProductRepository,
     ProductDocumentRepository,
     ProductWeaviateRepository,
-    HybridProductRepository,
+    ProductGraphRepository,
   ],
 })
 export class HybridProductPersistenceModule {}
