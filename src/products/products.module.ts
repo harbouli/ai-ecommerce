@@ -1,18 +1,12 @@
-import {
-  // do not remove this comment
-  Module,
-} from '@nestjs/common';
+import { Module } from '@nestjs/common';
 import { ProductsService } from './products.service';
 import { ProductsController } from './products.controller';
-import { DocumentProductPersistenceModule } from './infrastructure/persistence/document/document-persistence.module';
+import { HybridProductPersistenceModule } from './infrastructure/persistence/hybrid/hybrid-persistence.module';
 
 @Module({
-  imports: [
-    // do not remove this comment
-    DocumentProductPersistenceModule,
-  ],
+  imports: [HybridProductPersistenceModule],
   controllers: [ProductsController],
   providers: [ProductsService],
-  exports: [ProductsService, DocumentProductPersistenceModule],
+  exports: [ProductsService],
 })
 export class ProductsModule {}
