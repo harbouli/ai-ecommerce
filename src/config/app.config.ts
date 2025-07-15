@@ -1,6 +1,6 @@
 import { registerAs } from '@nestjs/config';
 import { AppConfig } from './app-config.type';
-import validateConfig from '.././utils/validate-config';
+import validateConfig from '../utils/validate-config';
 import {
   IsEnum,
   IsInt,
@@ -47,6 +47,19 @@ class EnvironmentVariablesValidator {
   @IsString()
   @IsOptional()
   APP_HEADER_LANGUAGE: string;
+
+  // Neo4j configuration
+  @IsString()
+  @IsOptional()
+  NEO4J_URI: string;
+
+  @IsString()
+  @IsOptional()
+  NEO4J_USERNAME: string;
+
+  @IsString()
+  @IsOptional()
+  NEO4J_PASSWORD: string;
 }
 
 export default registerAs<AppConfig>('app', () => {
@@ -66,5 +79,11 @@ export default registerAs<AppConfig>('app', () => {
     apiPrefix: process.env.API_PREFIX || 'api',
     fallbackLanguage: process.env.APP_FALLBACK_LANGUAGE || 'en',
     headerLanguage: process.env.APP_HEADER_LANGUAGE || 'x-custom-lang',
+    // Neo4j configuration
+    neo4j: {
+      uri: process.env.NEO4J_URI || 'bolt://localhost:7687',
+      username: process.env.NEO4J_USERNAME || 'neo4j',
+      password: process.env.NEO4J_PASSWORD || 'password',
+    },
   };
 });

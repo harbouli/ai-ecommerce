@@ -8,4 +8,9 @@ export type AppConfig = {
   apiPrefix: string;
   fallbackLanguage: string;
   headerLanguage: string;
+  neo4j: {
+    uri: string;
+    username: string;
+    password: string;
+  };
 };

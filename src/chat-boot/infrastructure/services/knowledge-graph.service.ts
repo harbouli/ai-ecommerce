@@ -16,7 +16,6 @@ export class KnowledgeGraphService {
     private readonly knowledgeGraphRepository: KnowledgeGraphRepository,
     private readonly productRepository: ProductRepository,
     private readonly mistralAiService: MistralAiService,
-    private readonly vectorStoreService: VectorStoreService,
   ) {}
 
   // Node Management
@@ -322,7 +321,7 @@ export class KnowledgeGraphService {
     }
   }
 
-  generateSimilarityReasons(product1: any, product2: any): Promise<string[]> {
+  generateSimilarityReasons(product1: any, product2: any): string[] {
     const reasons: string[] = [];
 
     if (product1.color && product2.color && product1.color === product2.color) {
@@ -368,22 +367,22 @@ export class KnowledgeGraphService {
         const productNode = new ProductNode({
           id: product.id,
           name: product.name,
-          description: product.description,
+          description: product.description ?? '',
           price: product.price,
-          costPrice: product.costPrice,
-          salePrice: product.salePrice,
-          stock: product.stock,
-          weight: product.weight,
-          dimensions: product.dimensions,
-          color: product.color,
-          size: product.size,
+          costPrice: product.costPrice ?? 0,
+          salePrice: product.salePrice ?? 0,
+          stock: product.stock ?? 0,
+          weight: product.weight ?? 0,
+          dimensions: product.dimensions ?? '',
+          color: product.color ?? '',
+          size: product.size ?? '',
           isActive: product.isActive,
           isFeatured: product.isFeatured,
           isDigital: product.isDigital,
-          metaTitle: product.metaTitle,
-          metaDescription: product.metaDescription,
-          publishedAt: product.publishedAt,
-          expiresAt: product.expiresAt,
+          metaTitle: product.metaTitle ?? '',
+          metaDescription: product.metaDescription ?? '',
+          publishedAt: product.publishedAt ?? new Date(),
+          expiresAt: product.expiresAt ?? new Date(),
         });
 
         await this.knowledgeGraphRepository.updateNode(productNode);
@@ -714,18 +713,14 @@ export class KnowledgeGraphService {
     services: {
       neo4j: boolean;
       mistralAi: boolean;
-      vectorStore: boolean;
     };
   }> {
-    const [neo4jHealth, mistralAiHealth, vectorStoreHealth] = await Promise.all(
-      [
-        this.knowledgeGraphRepository.healthCheck(),
-        this.checkMistralAiHealth(),
-        this.vectorStoreService.healthCheck(),
-      ],
-    );
+    const [neo4jHealth, mistralAiHealth] = await Promise.all([
+      this.knowledgeGraphRepository.healthCheck(),
+      this.checkMistralAiHealth(),
+    ]);
 
-    const allHealthy = neo4jHealth && mistralAiHealth && vectorStoreHealth;
+    const allHealthy = neo4jHealth && mistralAiHealth;
 
     return {
       status: allHealthy ? 'healthy' : 'unhealthy',
@@ -734,7 +729,6 @@ export class KnowledgeGraphService {
       services: {
         neo4j: neo4jHealth,
         mistralAi: mistralAiHealth,
-        vectorStore: vectorStoreHealth,
       },
     };
   }
