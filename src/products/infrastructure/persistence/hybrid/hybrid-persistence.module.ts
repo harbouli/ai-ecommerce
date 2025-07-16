@@ -32,6 +32,7 @@ import {
     ProductGraphRepository,
 
     // Hybrid repository that uses all three databases
+    HybridProductRepository,
     {
       provide: ProductRepository,
       useClass: HybridProductRepository,
@@ -39,6 +40,7 @@ import {
   ],
   exports: [
     ProductRepository,
+    HybridProductRepository,
     ProductDocumentRepository,
     ProductWeaviateRepository,
     ProductGraphRepository,

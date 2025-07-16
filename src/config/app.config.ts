@@ -4,6 +4,7 @@ import validateConfig from '../utils/validate-config';
 import {
   IsEnum,
   IsInt,
+  IsNumber,
   IsOptional,
   IsString,
   IsUrl,
@@ -16,7 +17,17 @@ enum Environment {
   Production = 'production',
   Test = 'test',
 }
-
+enum MistralModel {
+  LARGE = 'mistral-large-latest',
+  SMALL = 'mistral-small-latest',
+  NEMO = 'open-mistral-nemo',
+  MINISTRAL_8B = 'ministral-8b-latest',
+  MINISTRAL_3B = 'ministral-3b-latest',
+  CODESTRAL = 'codestral-latest',
+}
+enum EmbeddingModel {
+  EMBED = 'mistral-embed',
+}
 class EnvironmentVariablesValidator {
   @IsEnum(Environment)
   @IsOptional()
@@ -60,6 +71,22 @@ class EnvironmentVariablesValidator {
   @IsString()
   @IsOptional()
   NEO4J_PASSWORD: string;
+  @IsString()
+  MISTRAL_API_KEY: string;
+
+  @IsEnum(MistralModel)
+  @IsOptional()
+  MISTRAL_MODEL: MistralModel;
+
+  @IsEnum(EmbeddingModel)
+  @IsOptional()
+  MISTRAL_EMBEDDING_MODEL: EmbeddingModel;
+
+  @IsNumber()
+  @Min(0)
+  @Max(2)
+  @IsOptional()
+  MISTRAL_TEMPERATURE: number;
 }
 
 export default registerAs<AppConfig>('app', () => {
@@ -84,6 +111,16 @@ export default registerAs<AppConfig>('app', () => {
       uri: process.env.NEO4J_URI || 'bolt://localhost:7687',
       username: process.env.NEO4J_USERNAME || 'neo4j',
       password: process.env.NEO4J_PASSWORD || 'password',
+    },
+    mistral: {
+      apiKey: process.env.MISTRAL_API_KEY || '',
+      model: process.env.MISTRAL_MODEL || MistralModel.LARGE,
+      embeddingModel:
+        process.env.MISTRAL_EMBEDDING_MODEL || EmbeddingModel.EMBED,
+      temperature: process.env.MISTRAL_TEMPERATURE
+        ? process.env.MISTRAL_TEMPERATURE
+        : '0.7',
+      maxTokens: process.env.MISTRAL_MAX_TOKENS || '1000',
     },
   };
 });

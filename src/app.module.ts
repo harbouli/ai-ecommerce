@@ -24,6 +24,7 @@ import { MailerModule } from './mailer/mailer.module';
 import { MongooseModule } from '@nestjs/mongoose';
 import { MongooseConfigService } from './database/mongoose-config.service';
 import { ProductsModule } from './products/products.module';
+import { AIModule } from './ai/ai.module';
 
 const infrastructureDatabaseModule = MongooseModule.forRootAsync({
   useClass: MongooseConfigService,
@@ -71,6 +72,7 @@ const infrastructureDatabaseModule = MongooseModule.forRootAsync({
       inject: [ConfigService],
     }),
     UsersModule,
+    AIModule,
     FilesModule,
     AuthModule,
     AuthFacebookModule,

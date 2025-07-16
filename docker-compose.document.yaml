@@ -90,31 +90,27 @@ services:
       retries: 3
       start_period: 40s
 
-  # Neo4j Graph Database
+  # Neo4j Graph Database - Minimal Configuration
   neo4j:
-    image: neo4j:5.24-enterprise
+    image: neo4j:5.24-community
     restart: always
     ports:
       - "7474:7474"  # HTTP
       - "7687:7687"  # Bolt
     environment:
       NEO4J_AUTH: neo4j/password
-      NEO4J_ACCEPT_LICENSE_AGREEMENT: 'yes'
-      NEO4J_PLUGINS: '["apoc"]'
-      NEO4J_apoc_export_file_enabled: 'true'
-      NEO4J_apoc_import_file_enabled: 'true'
-      NEO4J_apoc_import_file_use__neo4j__config: 'true'
-      NEO4J_HEAP_MEMORY: 512M
-      NEO4J_CACHE_MEMORY: 256M
+      NEO4J_server_config_strict__validation_enabled: 'false'
+      NEO4J_server_memory_heap_initial__size: 128M
+      NEO4J_server_memory_heap_max__size: 256M
+      NEO4J_server_memory_pagecache_size: 64M
     volumes:
       - ai-ecommerce-neo4j-data:/data
-      - ai-ecommerce-neo4j-plugins:/plugins
     healthcheck:
       test: ["CMD", "cypher-shell", "--username", "neo4j", "--password", "password", "RETURN 1"]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 40s
+      retries: 5
+      start_period: 60s
 
   api:
     build:

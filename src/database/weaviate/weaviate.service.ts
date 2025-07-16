@@ -23,7 +23,6 @@ export class WeaviateService implements OnModuleInit {
     // Test connection
     try {
       await this.client.misc.liveChecker().do();
-      console.log('✅ Weaviate connection established');
     } catch (error) {
       console.error('❌ Weaviate connection failed:', error);
     }

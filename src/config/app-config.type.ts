@@ -13,4 +13,11 @@ export type AppConfig = {
     username: string;
     password: string;
   };
+  mistral: {
+    model: string;
+    embeddingModel: string;
+    temperature: string;
+    maxTokens: string;
+    apiKey: string;
+  };
 };

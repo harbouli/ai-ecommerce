@@ -355,4 +355,31 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     const result = await this.runQuery(query, { limit });
     return result.map((record) => record.p.properties);
   }
+  async read(
+    query: string,
+    parameters: Record<string, any> = {},
+  ): Promise<any> {
+    const session = this.getSession();
+    try {
+      const result = await session.run(query, parameters);
+      return result;
+    } finally {
+      await session.close();
+    }
+  }
+
+  async write(
+    query: string,
+    parameters: Record<string, any> = {},
+  ): Promise<any> {
+    const session = this.getSession();
+    try {
+      const result = await session.writeTransaction((tx) =>
+        tx.run(query, parameters),
+      );
+      return result;
+    } finally {
+      await session.close();
+    }
+  }
 }
