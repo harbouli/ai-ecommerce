@@ -1,10 +1,26 @@
-/* eslint-disable @typescript-eslint/no-unused-vars */
 import { Injectable, Logger } from '@nestjs/common';
 import { Neo4jService } from '../../../../../database/neo4j/neo4j.service';
 import {
   KnowledgeEntity,
   KnowledgeRelationship,
 } from '../../../../domain/knowledge';
+
+export interface CustomerPurchasePattern {
+  customerId: string;
+  productId: string;
+  categoryId: string;
+  purchaseDate: Date;
+  amount: number;
+  frequency: number;
+}
+
+export interface ProductRecommendationPath {
+  fromProductId: string;
+  toProductId: string;
+  reason: string;
+  strength: number;
+  conversionRate: number;
+}
 
 @Injectable()
 export class KnowledgeGraphRepository {
@@ -83,6 +99,495 @@ export class KnowledgeGraphRepository {
     }
   }
 
+  // ===== COMMERCE-SPECIFIC METHODS =====
+
+  /**
+   * Creates customer purchase behavior nodes and relationships
+   */
+  async createCustomerPurchasePattern(
+    pattern: CustomerPurchasePattern,
+  ): Promise<void> {
+    const query = `
+      MERGE (c:Customer {id: $customerId})
+      MERGE (p:Product {id: $productId})
+      MERGE (cat:Category {id: $categoryId})
+      
+      // Create purchase relationship
+      CREATE (c)-[purchase:PURCHASED {
+        date: datetime($purchaseDate),
+        amount: $amount,
+        frequency: $frequency,
+        createdAt: datetime()
+      }]->(p)
+      
+      // Connect product to category
+      MERGE (p)-[:BELONGS_TO]->(cat)
+      
+      // Track customer category affinity
+      MERGE (c)-[affinity:INTERESTED_IN]->(cat)
+      ON CREATE SET affinity.strength = 1, affinity.purchases = 1
+      ON MATCH SET affinity.strength = affinity.strength + 1, 
+                   affinity.purchases = affinity.purchases + 1
+      
+      RETURN purchase
+    `;
+
+    try {
+      await this.neo4jService.write(query, {
+        customerId: pattern.customerId,
+        productId: pattern.productId,
+        categoryId: pattern.categoryId,
+        purchaseDate: pattern.purchaseDate.toISOString(),
+        amount: pattern.amount,
+        frequency: pattern.frequency,
+      });
+
+      this.logger.log(
+        `Created purchase pattern: ${pattern.customerId} -> ${pattern.productId}`,
+      );
+    } catch (error) {
+      this.logger.error('Error creating customer purchase pattern:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Finds products frequently bought together for cross-selling
+   */
+  async findFrequentlyBoughtTogether(
+    productId: string,
+    limit: number = 5,
+  ): Promise<any[]> {
+    const query = `
+      MATCH (p1:Product {id: $productId})<-[:PURCHASED]-(c:Customer)-[:PURCHASED]->(p2:Product)
+      WHERE p1.id <> p2.id
+      WITH p2, COUNT(c) as coOccurrence
+      ORDER BY coOccurrence DESC
+      LIMIT $limit
+      
+      MATCH (p2)<-[purchase:PURCHASED]-(customer:Customer)
+      WITH p2, coOccurrence, 
+           AVG(purchase.amount) as avgPurchaseAmount,
+           COUNT(DISTINCT customer) as totalCustomers
+      
+      RETURN p2.id as productId, p2.name as productName,
+             coOccurrence, avgPurchaseAmount, totalCustomers,
+             (coOccurrence * 1.0 / totalCustomers) as affinity
+      ORDER BY affinity DESC, coOccurrence DESC
+    `;
+
+    try {
+      const result = await this.neo4jService.read(query, { productId, limit });
+      return result.records.map((record) => ({
+        productId: record.get('productId'),
+        productName: record.get('productName'),
+        coOccurrence: record.get('coOccurrence').toNumber(),
+        avgPurchaseAmount: record.get('avgPurchaseAmount'),
+        totalCustomers: record.get('totalCustomers').toNumber(),
+        affinity: record.get('affinity'),
+      }));
+    } catch (error) {
+      this.logger.error('Error finding frequently bought together:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Gets personalized product recommendations based on customer behavior
+   */
+  async getPersonalizedRecommendations(
+    customerId: string,
+    limit: number = 10,
+  ): Promise<any[]> {
+    const query = `
+      // Find customer's purchase history and preferences
+      MATCH (c:Customer {id: $customerId})-[:PURCHASED]->(purchased:Product)-[:BELONGS_TO]->(cat:Category)
+      WITH c, COLLECT(DISTINCT cat.id) as preferredCategories, 
+           COLLECT(DISTINCT purchased.id) as purchasedProducts
+      
+      // Find products in preferred categories not yet purchased
+      MATCH (rec:Product)-[:BELONGS_TO]->(prefCat:Category)
+      WHERE prefCat.id IN preferredCategories 
+        AND NOT rec.id IN purchasedProducts
+      
+      // Calculate recommendation score based on category affinity and product popularity
+      MATCH (c)-[affinity:INTERESTED_IN]->(prefCat)
+      MATCH (rec)<-[otherPurchases:PURCHASED]-(otherCustomers:Customer)
+      
+      WITH rec, prefCat, affinity.strength as categoryAffinity,
+           COUNT(otherPurchases) as popularity,
+           AVG(otherPurchases.amount) as avgPrice
+      
+      // Also consider customers with similar purchase patterns
+      MATCH (c)-[:PURCHASED]->(commonProduct:Product)<-[:PURCHASED]-(similar:Customer)
+      MATCH (similar)-[:PURCHASED]->(rec)
+      WITH rec, categoryAffinity, popularity, avgPrice,
+           COUNT(DISTINCT similar) as similarCustomers
+      
+      // Calculate final recommendation score
+      WITH rec, categoryAffinity, popularity, avgPrice, similarCustomers,
+           (categoryAffinity * 0.4 + popularity * 0.3 + similarCustomers * 0.3) as score
+      
+      RETURN rec.id as productId, rec.name as productName,
+             score, categoryAffinity, popularity, similarCustomers, avgPrice
+      ORDER BY score DESC
+      LIMIT $limit
+    `;
+
+    try {
+      const result = await this.neo4jService.read(query, { customerId, limit });
+      return result.records.map((record) => ({
+        productId: record.get('productId'),
+        productName: record.get('productName'),
+        score: record.get('score'),
+        categoryAffinity: record.get('categoryAffinity'),
+        popularity: record.get('popularity').toNumber(),
+        similarCustomers: record.get('similarCustomers').toNumber(),
+        avgPrice: record.get('avgPrice'),
+      }));
+    } catch (error) {
+      this.logger.error('Error getting personalized recommendations:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Creates product-to-product recommendation relationships
+   */
+  async createProductRecommendationPath(
+    fromProductId: string,
+    toProductId: string,
+    reason: string,
+    strength: number = 1.0,
+    conversionRate: number = 0.0,
+  ): Promise<void> {
+    const query = `
+      MATCH (from:Product {id: $fromProductId})
+      MATCH (to:Product {id: $toProductId})
+      MERGE (from)-[r:RECOMMENDS]->(to)
+      ON CREATE SET r.reason = $reason, 
+                    r.strength = $strength,
+                    r.conversionRate = $conversionRate,
+                    r.timesRecommended = 1,
+                    r.timesAccepted = 0,
+                    r.createdAt = datetime()
+      ON MATCH SET r.strength = (r.strength + $strength) / 2,
+                   r.timesRecommended = r.timesRecommended + 1,
+                   r.updatedAt = datetime()
+      RETURN r
+    `;
+
+    try {
+      await this.neo4jService.write(query, {
+        fromProductId,
+        toProductId,
+        reason,
+        strength,
+        conversionRate,
+      });
+
+      this.logger.log(
+        `Created recommendation path: ${fromProductId} -> ${toProductId}`,
+      );
+    } catch (error) {
+      this.logger.error('Error creating recommendation path:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Updates recommendation success when a customer follows a recommendation
+   */
+  async updateRecommendationSuccess(
+    fromProductId: string,
+    toProductId: string,
+  ): Promise<void> {
+    const query = `
+      MATCH (from:Product {id: $fromProductId})-[r:RECOMMENDS]->(to:Product {id: $toProductId})
+      SET r.timesAccepted = r.timesAccepted + 1,
+          r.conversionRate = (r.timesAccepted * 1.0) / r.timesRecommended,
+          r.updatedAt = datetime()
+      RETURN r.conversionRate as newConversionRate
+    `;
+
+    try {
+      const result = await this.neo4jService.write(query, {
+        fromProductId,
+        toProductId,
+      });
+      const conversionRate = result.records[0]?.get('newConversionRate') || 0;
+      this.logger.log(
+        `Updated recommendation success: ${fromProductId} -> ${toProductId}, conversion: ${conversionRate}`,
+      );
+    } catch (error) {
+      this.logger.error('Error updating recommendation success:', error);
+    }
+  }
+
+  /**
+   * Finds trending products based on recent purchase patterns
+   */
+  async findTrendingProducts(
+    timeframe: 'day' | 'week' | 'month' = 'week',
+    limit: number = 10,
+  ): Promise<any[]> {
+    const timeframeDays =
+      timeframe === 'day' ? 1 : timeframe === 'week' ? 7 : 30;
+
+    const query = `
+      MATCH (p:Product)<-[purchase:PURCHASED]-(c:Customer)
+      WHERE purchase.date >= datetime() - duration({days: $timeframeDays})
+      
+      WITH p, COUNT(purchase) as recentPurchases,
+           AVG(purchase.amount) as avgAmount,
+           COUNT(DISTINCT c) as uniqueCustomers
+      
+      // Calculate trend score based on purchase velocity and customer reach
+      WITH p, recentPurchases, avgAmount, uniqueCustomers,
+           (recentPurchases * uniqueCustomers * avgAmount) as trendScore
+      
+      RETURN p.id as productId, p.name as productName,
+             recentPurchases, uniqueCustomers, avgAmount, trendScore
+      ORDER BY trendScore DESC
+      LIMIT $limit
+    `;
+
+    try {
+      const result = await this.neo4jService.read(query, {
+        timeframeDays,
+        limit,
+      });
+      return result.records.map((record) => ({
+        productId: record.get('productId'),
+        productName: record.get('productName'),
+        recentPurchases: record.get('recentPurchases').toNumber(),
+        uniqueCustomers: record.get('uniqueCustomers').toNumber(),
+        avgAmount: record.get('avgAmount'),
+        trendScore: record.get('trendScore'),
+      }));
+    } catch (error) {
+      this.logger.error('Error finding trending products:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Finds customers similar to a given customer for collaborative filtering
+   */
+  async findSimilarCustomers(
+    customerId: string,
+    limit: number = 10,
+  ): Promise<any[]> {
+    const query = `
+      MATCH (c1:Customer {id: $customerId})-[:PURCHASED]->(p:Product)<-[:PURCHASED]-(c2:Customer)
+      WHERE c1.id <> c2.id
+      
+      WITH c1, c2, COUNT(p) as commonProducts
+      
+      // Get total products purchased by each customer
+      MATCH (c1)-[:PURCHASED]->(p1:Product)
+      WITH c1, c2, commonProducts, COUNT(p1) as c1TotalProducts
+      
+      MATCH (c2)-[:PURCHASED]->(p2:Product)  
+      WITH c1, c2, commonProducts, c1TotalProducts, COUNT(p2) as c2TotalProducts
+      
+      // Calculate Jaccard similarity
+      WITH c1, c2, commonProducts, c1TotalProducts, c2TotalProducts,
+           (commonProducts * 1.0) / (c1TotalProducts + c2TotalProducts - commonProducts) as similarity
+      
+      WHERE similarity > 0.1
+      RETURN c2.id as customerId, similarity, commonProducts
+      ORDER BY similarity DESC
+      LIMIT $limit
+    `;
+
+    try {
+      const result = await this.neo4jService.read(query, { customerId, limit });
+      return result.records.map((record) => ({
+        customerId: record.get('customerId'),
+        similarity: record.get('similarity'),
+        commonProducts: record.get('commonProducts').toNumber(),
+      }));
+    } catch (error) {
+      this.logger.error('Error finding similar customers:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Tracks customer objections and successful responses for sales optimization
+   */
+  async trackCustomerObjection(
+    customerId: string,
+    productId: string,
+    objection: string,
+    response: string,
+    successful: boolean,
+  ): Promise<void> {
+    const query = `
+      MATCH (c:Customer {id: $customerId})
+      MATCH (p:Product {id: $productId})
+      
+      CREATE (c)-[obj:HAD_OBJECTION {
+        objection: $objection,
+        response: $response,
+        successful: $successful,
+        timestamp: datetime()
+      }]->(p)
+      
+      // Update objection statistics
+      MERGE (p)-[stat:OBJECTION_STATS {type: $objection}]->(os:ObjectionSummary {type: $objection})
+      ON CREATE SET stat.total = 1, 
+                    stat.successful = CASE WHEN $successful THEN 1 ELSE 0 END
+      ON MATCH SET stat.total = stat.total + 1,
+                   stat.successful = stat.successful + CASE WHEN $successful THEN 1 ELSE 0 END
+      
+      RETURN obj
+    `;
+
+    try {
+      await this.neo4jService.write(query, {
+        customerId,
+        productId,
+        objection,
+        response,
+        successful,
+      });
+
+      this.logger.log(
+        `Tracked objection: ${objection} for product ${productId}`,
+      );
+    } catch (error) {
+      this.logger.error('Error tracking customer objection:', error);
+    }
+  }
+
+  /**
+   * Gets successful objection handling strategies for a product
+   */
+  async getSuccessfulObjectionResponses(
+    productId: string,
+    objectionType?: string,
+  ): Promise<any[]> {
+    const objectionFilter = objectionType
+      ? 'AND obj.objection = $objectionType'
+      : '';
+
+    const query = `
+      MATCH (p:Product {id: $productId})<-[obj:HAD_OBJECTION]-(c:Customer)
+      WHERE obj.successful = true ${objectionFilter}
+      
+      WITH obj.objection as objection, obj.response as response, 
+           COUNT(*) as successCount
+      
+      RETURN objection, response, successCount
+      ORDER BY successCount DESC, objection
+    `;
+
+    try {
+      const params: any = { productId };
+      if (objectionType) params.objectionType = objectionType;
+
+      const result = await this.neo4jService.read(query, params);
+      return result.records.map((record) => ({
+        objection: record.get('objection'),
+        response: record.get('response'),
+        successCount: record.get('successCount').toNumber(),
+      }));
+    } catch (error) {
+      this.logger.error('Error getting successful objection responses:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Creates customer journey tracking
+   */
+  async trackCustomerJourneyStep(
+    customerId: string,
+    step: string,
+    productId?: string,
+    metadata?: Record<string, any>,
+  ): Promise<void> {
+    const query = `
+      MATCH (c:Customer {id: $customerId})
+      CREATE (c)-[journey:JOURNEY_STEP {
+        step: $step,
+        productId: $productId,
+        metadata: $metadata,
+        timestamp: datetime()
+      }]->(js:JourneyStep {step: $step})
+      
+      RETURN journey
+    `;
+
+    try {
+      await this.neo4jService.write(query, {
+        customerId,
+        step,
+        productId: productId || null,
+        metadata: metadata || {},
+      });
+
+      this.logger.log(
+        `Tracked journey step: ${step} for customer ${customerId}`,
+      );
+    } catch (error) {
+      this.logger.error('Error tracking customer journey step:', error);
+    }
+  }
+
+  /**
+   * Gets customer journey analysis for conversion optimization
+   */
+  async analyzeCustomerJourney(customerId: string): Promise<any> {
+    const query = `
+      MATCH (c:Customer {id: $customerId})-[journey:JOURNEY_STEP]->(step:JourneyStep)
+      
+      WITH journey, step
+      ORDER BY journey.timestamp
+      
+      WITH COLLECT({
+        step: step.step,
+        productId: journey.productId,
+        metadata: journey.metadata,
+        timestamp: journey.timestamp
+      }) as journeySteps
+      
+      // Analyze conversion funnel
+      WITH journeySteps,
+           SIZE([s IN journeySteps WHERE s.step = 'BROWSING']) as browsingSteps,
+           SIZE([s IN journeySteps WHERE s.step = 'PRODUCT_VIEW']) as productViews,
+           SIZE([s IN journeySteps WHERE s.step = 'CART_ADD']) as cartAdds,
+           SIZE([s IN journeySteps WHERE s.step = 'PURCHASE']) as purchases
+      
+      RETURN journeySteps, browsingSteps, productViews, cartAdds, purchases,
+             CASE WHEN productViews > 0 THEN (cartAdds * 1.0 / productViews) ELSE 0 END as viewToCartRate,
+             CASE WHEN cartAdds > 0 THEN (purchases * 1.0 / cartAdds) ELSE 0 END as cartToPurchaseRate
+    `;
+
+    try {
+      const result = await this.neo4jService.read(query, { customerId });
+      if (result.records.length === 0) return null;
+
+      const record = result.records[0];
+      return {
+        journeySteps: record.get('journeySteps'),
+        browsingSteps: record.get('browsingSteps').toNumber(),
+        productViews: record.get('productViews').toNumber(),
+        cartAdds: record.get('cartAdds').toNumber(),
+        purchases: record.get('purchases').toNumber(),
+        viewToCartRate: record.get('viewToCartRate'),
+        cartToPurchaseRate: record.get('cartToPurchaseRate'),
+      };
+    } catch (error) {
+      this.logger.error('Error analyzing customer journey:', error);
+      return null;
+    }
+  }
+
+  // ===== ENHANCED KNOWLEDGE GRAPH METHODS =====
+
   async findRelatedEntities(
     entityId: string,
     hops: number = 2,
@@ -135,59 +640,6 @@ export class KnowledgeGraphRepository {
       });
     } catch (error) {
       this.logger.error('Error finding entity relationships:', error);
-      return [];
-    }
-  }
-
-  async findShortestPath(
-    fromEntityId: string,
-    toEntityId: string,
-  ): Promise<any[]> {
-    const query = `
-      MATCH (from:KnowledgeEntity {id: $fromEntityId})
-      MATCH (to:KnowledgeEntity {id: $toEntityId})
-      MATCH path = shortestPath((from)-[*]-(to))
-      RETURN path, LENGTH(path) as pathLength
-    `;
-
-    try {
-      const result = await this.neo4jService.read(query, {
-        fromEntityId,
-        toEntityId,
-      });
-
-      if (result.records.length === 0) {
-        return [];
-      }
-
-      const record = result.records[0];
-      const path = record.get('path');
-      const pathLength = record.get('pathLength');
-
-      const pathNodes = path.segments.map((segment: any) => ({
-        entity: this.mapToKnowledgeEntity(segment.start),
-        relationship: {
-          type: segment.relationship.type,
-          weight: segment.relationship.properties.weight,
-          properties: segment.relationship.properties.properties || {},
-        },
-        nextEntity: this.mapToKnowledgeEntity(segment.end),
-      }));
-
-      return [
-        {
-          path: pathNodes,
-          length: pathLength,
-          entities: [
-            this.mapToKnowledgeEntity(path.start),
-            ...path.segments.map((segment: any) =>
-              this.mapToKnowledgeEntity(segment.end),
-            ),
-          ],
-        },
-      ];
-    } catch (error) {
-      this.logger.error('Error finding shortest path:', error);
       return [];
     }
   }
@@ -253,296 +705,7 @@ export class KnowledgeGraphRepository {
     }
   }
 
-  async findEntityClusters(entityType: string): Promise<any[]> {
-    const query = `
-      MATCH (e:KnowledgeEntity {type: $entityType})
-      MATCH (e)-[r]-(connected:KnowledgeEntity)
-      WITH e, COUNT(connected) as connections, COLLECT(connected.type) as connectedTypes
-      WITH e, connections, connectedTypes, 
-           SIZE([type IN connectedTypes WHERE type = $entityType]) as sameTypeConnections
-      ORDER BY connections DESC, sameTypeConnections DESC
-      RETURN e.id as entityId, e.name as entityName, 
-             connections, sameTypeConnections, connectedTypes
-    `;
-
-    try {
-      const result = await this.neo4jService.read(query, { entityType });
-      return result.records.map((record) => ({
-        entityId: record.get('entityId'),
-        entityName: record.get('entityName'),
-        connections: record.get('connections').toNumber(),
-        sameTypeConnections: record.get('sameTypeConnections').toNumber(),
-        connectedTypes: record.get('connectedTypes'),
-      }));
-    } catch (error) {
-      this.logger.error('Error finding entity clusters:', error);
-      return [];
-    }
-  }
-
-  async createProductRecommendationPath(
-    userId: string,
-    productId: string,
-    reason: string,
-  ): Promise<void> {
-    const query = `
-      MERGE (u:User {id: $userId})
-      MERGE (p:Product {id: $productId})
-      MERGE (u)-[r:RECOMMENDED]->(p)
-      SET r.reason = $reason,
-          r.createdAt = datetime(),
-          r.score = COALESCE(r.score, 0) + 1
-      RETURN r
-    `;
-
-    try {
-      await this.neo4jService.write(query, { userId, productId, reason });
-      this.logger.log(`Created recommendation path: ${userId} -> ${productId}`);
-    } catch (error) {
-      this.logger.error('Error creating recommendation path:', error);
-      throw error;
-    }
-  }
-
-  async findRecommendationReasons(
-    userId: string,
-    productId: string,
-  ): Promise<string[]> {
-    const query = `
-      MATCH (u:User {id: $userId})-[r:RECOMMENDED]->(p:Product {id: $productId})
-      RETURN r.reason as reason, r.score as score
-      ORDER BY r.score DESC
-    `;
-
-    try {
-      const result = await this.neo4jService.read(query, { userId, productId });
-      return result.records.map((record) => record.get('reason'));
-    } catch (error) {
-      this.logger.error('Error finding recommendation reasons:', error);
-      return [];
-    }
-  }
-
-  async updateRelationshipWeight(
-    relationshipId: string,
-    weight: number,
-  ): Promise<void> {
-    const query = `
-      MATCH ()-[r {id: $relationshipId}]->()
-      SET r.weight = $weight,
-          r.updatedAt = datetime()
-      RETURN r
-    `;
-
-    try {
-      await this.neo4jService.write(query, { relationshipId, weight });
-      this.logger.log(`Updated relationship weight: ${relationshipId}`);
-    } catch (error) {
-      this.logger.error('Error updating relationship weight:', error);
-      throw error;
-    }
-  }
-
-  // Additional utility methods for comprehensive knowledge graph operations
-
-  async findEntityNeighbors(
-    entityId: string,
-    relationshipType?: string,
-    limit: number = 10,
-  ): Promise<KnowledgeEntity[]> {
-    const relationshipFilter = relationshipType
-      ? `[r:${relationshipType}]`
-      : '[r]';
-
-    const query = `
-      MATCH (e:KnowledgeEntity {id: $entityId})${relationshipFilter}(neighbor:KnowledgeEntity)
-      RETURN neighbor, r.weight as weight
-      ORDER BY weight DESC
-      LIMIT $limit
-    `;
-
-    try {
-      const result = await this.neo4jService.read(query, { entityId, limit });
-      return result.records.map((record) =>
-        this.mapToKnowledgeEntity(record.get('neighbor')),
-      );
-    } catch (error) {
-      this.logger.error('Error finding entity neighbors:', error);
-      return [];
-    }
-  }
-
-  async findStronglyConnectedComponents(entityType: string): Promise<any[]> {
-    const query = `
-      MATCH (e:KnowledgeEntity {type: $entityType})
-      CALL gds.alpha.scc.stream({
-        nodeProjection: {
-          KnowledgeEntity: {
-            label: 'KnowledgeEntity',
-            properties: ['id', 'type', 'name']
-          }
-        },
-        relationshipProjection: '*'
-      })
-      YIELD nodeId, componentId
-      WITH gds.util.asNode(nodeId) as node, componentId
-      WHERE node.type = $entityType
-      RETURN componentId, COLLECT(node.id) as entityIds, COUNT(node) as componentSize
-      ORDER BY componentSize DESC
-    `;
-
-    try {
-      const result = await this.neo4jService.read(query, { entityType });
-      return result.records.map((record) => ({
-        componentId: record.get('componentId'),
-        entityIds: record.get('entityIds'),
-        componentSize: record.get('componentSize').toNumber(),
-      }));
-    } catch (error) {
-      this.logger.warn('GDS not available, using basic clustering');
-      return await this.findBasicClusters(entityType);
-    }
-  }
-
-  private async findBasicClusters(entityType: string): Promise<any[]> {
-    const query = `
-      MATCH (e:KnowledgeEntity {type: $entityType})-[r]-(connected:KnowledgeEntity)
-      WITH e, COUNT(connected) as degree
-      WHERE degree > 1
-      RETURN e.id as entityId, degree
-      ORDER BY degree DESC
-    `;
-
-    try {
-      const result = await this.neo4jService.read(query, { entityType });
-      return result.records.map((record) => ({
-        entityId: record.get('entityId'),
-        degree: record.get('degree').toNumber(),
-      }));
-    } catch (error) {
-      this.logger.error('Error finding basic clusters:', error);
-      return [];
-    }
-  }
-
-  async findInfluentialEntities(
-    entityType: string,
-    limit: number = 10,
-  ): Promise<any[]> {
-    const query = `
-      MATCH (e:KnowledgeEntity {type: $entityType})
-      MATCH (e)-[r]-(connected:KnowledgeEntity)
-      WITH e, COUNT(connected) as degree, 
-           AVG(r.weight) as avgWeight,
-           COUNT(DISTINCT connected.type) as typesDiversity
-      WITH e, degree, avgWeight, typesDiversity,
-           (degree * avgWeight * typesDiversity) as influence
-      ORDER BY influence DESC
-      LIMIT $limit
-      RETURN e.id as entityId, e.name as entityName, 
-             degree, avgWeight, typesDiversity, influence
-    `;
-
-    try {
-      const result = await this.neo4jService.read(query, { entityType, limit });
-      return result.records.map((record) => ({
-        entityId: record.get('entityId'),
-        entityName: record.get('entityName'),
-        degree: record.get('degree').toNumber(),
-        avgWeight: record.get('avgWeight'),
-        typesDiversity: record.get('typesDiversity').toNumber(),
-        influence: record.get('influence'),
-      }));
-    } catch (error) {
-      this.logger.error('Error finding influential entities:', error);
-      return [];
-    }
-  }
-
-  async findEntitySimilarity(
-    entityId: string,
-    limit: number = 5,
-  ): Promise<any[]> {
-    const query = `
-      MATCH (e:KnowledgeEntity {id: $entityId})-[r1]-(common:KnowledgeEntity)-[r2]-(similar:KnowledgeEntity)
-      WHERE e.id <> similar.id
-      WITH similar, COUNT(common) as commonNeighbors, 
-           AVG(r1.weight + r2.weight) as avgConnectionWeight
-      ORDER BY commonNeighbors DESC, avgConnectionWeight DESC
-      LIMIT $limit
-      RETURN similar, commonNeighbors, avgConnectionWeight
-    `;
-
-    try {
-      const result = await this.neo4jService.read(query, { entityId, limit });
-      return result.records.map((record) => ({
-        entity: this.mapToKnowledgeEntity(record.get('similar')),
-        commonNeighbors: record.get('commonNeighbors').toNumber(),
-        avgConnectionWeight: record.get('avgConnectionWeight'),
-      }));
-    } catch (error) {
-      this.logger.error('Error finding entity similarity:', error);
-      return [];
-    }
-  }
-
-  async getKnowledgeGraphStats(): Promise<any> {
-    const query = `
-      MATCH (e:KnowledgeEntity)
-      OPTIONAL MATCH (e)-[r]-(connected:KnowledgeEntity)
-      WITH e.type as entityType, COUNT(DISTINCT e) as entityCount, 
-           COUNT(r) as relationshipCount
-      RETURN entityType, entityCount, relationshipCount
-      ORDER BY entityCount DESC
-    `;
-
-    try {
-      const result = await this.neo4jService.read(query);
-      return result.records.map((record) => ({
-        entityType: record.get('entityType'),
-        entityCount: record.get('entityCount').toNumber(),
-        relationshipCount: record.get('relationshipCount').toNumber(),
-      }));
-    } catch (error) {
-      this.logger.error('Error getting knowledge graph stats:', error);
-      return [];
-    }
-  }
-
-  async findConceptualPaths(
-    fromConcept: string,
-    toConcept: string,
-    maxHops: number = 5,
-  ): Promise<any[]> {
-    const query = `
-      MATCH (from:KnowledgeEntity)
-      WHERE from.name CONTAINS $fromConcept OR from.description CONTAINS $fromConcept
-      MATCH (to:KnowledgeEntity)
-      WHERE to.name CONTAINS $toConcept OR to.description CONTAINS $toConcept
-      MATCH path = (from)-[*1..${maxHops}]-(to)
-      WHERE from.id <> to.id
-      WITH path, LENGTH(path) as pathLength, 
-           REDUCE(totalWeight = 0, r in relationships(path) | totalWeight + r.weight) as totalWeight
-      ORDER BY pathLength ASC, totalWeight DESC
-      LIMIT 10
-      RETURN path, pathLength, totalWeight
-    `;
-
-    try {
-      const result = await this.neo4jService.read(query, {
-        fromConcept,
-        toConcept,
-      });
-      return result.records.map((record) => ({
-        path: this.mapPathToEntities(record.get('path')),
-        pathLength: record.get('pathLength').toNumber(),
-        totalWeight: record.get('totalWeight'),
-      }));
-    } catch (error) {
-      this.logger.error('Error finding conceptual paths:', error);
-      return [];
-    }
-  }
+  // ===== UTILITY METHODS =====
 
   private mapToKnowledgeEntity(node: any): KnowledgeEntity {
     return {
@@ -557,24 +720,8 @@ export class KnowledgeGraphRepository {
     };
   }
 
-  private mapPathToEntities(path: any): any[] {
-    const entities: any[] = [this.mapToKnowledgeEntity(path.start)];
+  // ===== BULK OPERATIONS =====
 
-    for (const segment of path.segments) {
-      entities.push({
-        relationship: {
-          type: segment.relationship.type,
-          weight: segment.relationship.properties.weight,
-          properties: segment.relationship.properties.properties || {},
-        },
-        entity: this.mapToKnowledgeEntity(segment.end),
-      });
-    }
-
-    return entities;
-  }
-
-  // Bulk operations for performance
   async createEntitiesBatch(entities: KnowledgeEntity[]): Promise<void> {
     const query = `
       UNWIND $entities as entityData
@@ -615,45 +762,11 @@ export class KnowledgeGraphRepository {
   async createRelationshipsBatch(
     relationships: KnowledgeRelationship[],
   ): Promise<void> {
-    const query = `
-      UNWIND $relationships as relData
-      MATCH (from:KnowledgeEntity {id: relData.fromEntityId})
-      MATCH (to:KnowledgeEntity {id: relData.toEntityId})
-      CALL apoc.create.relationship(from, relData.type, {
-        id: relData.id,
-        weight: relData.weight,
-        properties: relData.properties,
-        createdAt: datetime(relData.createdAt)
-      }, to) YIELD rel
-      RETURN count(rel) as created
-    `;
-
-    const parameters = {
-      relationships: relationships.map((rel) => ({
-        id: rel.id,
-        fromEntityId: rel.fromEntityId,
-        toEntityId: rel.toEntityId,
-        type: rel.type,
-        weight: rel.weight,
-        properties: rel.properties || {},
-        createdAt: rel.createdAt?.toISOString() || new Date().toISOString(),
-      })),
-    };
-
-    try {
-      await this.neo4jService.write(query, parameters);
-      this.logger.log(`Created ${relationships.length} relationships in batch`);
-    } catch (error) {
-      this.logger.warn('APOC not available, using basic batch creation');
-      await this.createRelationshipsBatchBasic(relationships);
-    }
-  }
-
-  private async createRelationshipsBatchBasic(
-    relationships: KnowledgeRelationship[],
-  ): Promise<void> {
+    // Use basic batch creation since we can't assume APOC is available
     for (const relationship of relationships) {
       await this.createKnowledgeRelationship(relationship);
     }
+
+    this.logger.log(`Created ${relationships.length} relationships in batch`);
   }
 }
