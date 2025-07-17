@@ -1,3 +1,4 @@
+// src/chat/infrastructure/persistence/hybrid/hybrid-knowledge.repository.ts
 import { Injectable, Logger } from '@nestjs/common';
 import { KnowledgeEntity } from '../../../domain/knowledge';
 import { KnowledgeRepository } from '../knowledge.repository';
@@ -11,48 +12,34 @@ export class HybridKnowledgeRepository implements KnowledgeRepository {
   private readonly logger = new Logger(HybridKnowledgeRepository.name);
 
   constructor(
-    private mongoRepository: KnowledgeDocumentRepository,
-    private vectorRepository: KnowledgeVectorRepository,
-    private graphRepository: KnowledgeGraphRepository,
+    private readonly mongoRepository: KnowledgeDocumentRepository,
+    private readonly vectorRepository: KnowledgeVectorRepository,
+    private readonly graphRepository: KnowledgeGraphRepository,
   ) {}
+  findByProperties(
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    properties: Record<string, any>,
+  ): Promise<KnowledgeEntity[]> {
+    throw new Error('Method not implemented.');
+  }
 
+  // ===== BASIC CRUD OPERATIONS =====
   async create(data: Omit<KnowledgeEntity, 'id'>): Promise<KnowledgeEntity> {
     try {
-      // 1. Create in MongoDB first (primary storage)
-      const createdEntity = await this.mongoRepository.create(data);
-      this.logger.log(
-        `Knowledge entity created in MongoDB: ${createdEntity.id}`,
+      // 1. Create in MongoDB (primary storage)
+      const entity = await this.mongoRepository.create(data);
+
+      // 2. Store vector for RAG (semantic search)
+      this.storeVector(entity).catch((error) =>
+        this.logger.warn(`Vector storage failed for ${entity.id}:`, error),
       );
 
-      // 2. Store in Weaviate for vector search
-      try {
-        await this.vectorRepository.storeKnowledgeVector(createdEntity);
-        this.logger.log(
-          `Knowledge vector stored in Weaviate: ${createdEntity.id}`,
-        );
-      } catch (vectorError) {
-        this.logger.error(
-          `Failed to store knowledge vector: ${createdEntity.id}`,
-          vectorError,
-        );
-        // Don't fail the entire operation
-      }
+      // 3. Create graph relationships for KAG
+      this.createGraphNode(entity).catch((error) =>
+        this.logger.warn(`Graph creation failed for ${entity.id}:`, error),
+      );
 
-      // 3. Create in Neo4j for graph relationships
-      try {
-        await this.graphRepository.createKnowledgeEntity(createdEntity);
-        this.logger.log(
-          `Knowledge entity created in Neo4j: ${createdEntity.id}`,
-        );
-      } catch (graphError) {
-        this.logger.error(
-          `Failed to create knowledge entity in Neo4j: ${createdEntity.id}`,
-          graphError,
-        );
-        // Don't fail the entire operation
-      }
-
-      return createdEntity;
+      return entity;
     } catch (error) {
       this.logger.error('Failed to create knowledge entity:', error);
       throw error;
@@ -62,18 +49,7 @@ export class HybridKnowledgeRepository implements KnowledgeRepository {
   async findById(
     id: KnowledgeEntity['id'],
   ): Promise<NullableType<KnowledgeEntity>> {
-    // Use MongoDB as primary source for individual lookups
-    return await this.mongoRepository.findById(id);
-  }
-
-  async findByType(type: string): Promise<KnowledgeEntity[]> {
-    // Use MongoDB for type-based queries
-    return await this.mongoRepository.findByType(type);
-  }
-
-  async findByName(name: string): Promise<KnowledgeEntity[]> {
-    // Use MongoDB for name-based queries
-    return await this.mongoRepository.findByName(name);
+    return this.mongoRepository.findById(id);
   }
 
   async update(
@@ -81,142 +57,91 @@ export class HybridKnowledgeRepository implements KnowledgeRepository {
     payload: Partial<KnowledgeEntity>,
   ): Promise<KnowledgeEntity | null> {
     try {
-      // 1. Update in MongoDB
-      const updatedEntity = await this.mongoRepository.update(id, payload);
+      const entity = await this.mongoRepository.update(id, payload);
 
-      if (updatedEntity) {
-        this.logger.log(`Knowledge entity updated in MongoDB: ${id}`);
-
-        // 2. Update in Weaviate
-        try {
-          await this.vectorRepository.storeKnowledgeVector(updatedEntity);
-          this.logger.log(`Knowledge vector updated in Weaviate: ${id}`);
-        } catch (vectorError) {
-          this.logger.error(
-            `Failed to update knowledge vector: ${id}`,
-            vectorError,
-          );
-        }
-
-        // 3. Update in Neo4j
-        try {
-          if (payload.properties) {
-            await this.graphRepository.updateEntityProperties(
-              id,
-              payload.properties,
-            );
-          }
-          this.logger.log(`Knowledge entity updated in Neo4j: ${id}`);
-        } catch (graphError) {
-          this.logger.error(
-            `Failed to update knowledge entity in Neo4j: ${id}`,
-            graphError,
-          );
-        }
+      if (entity) {
+        // Update vector and graph asynchronously
+        this.storeVector(entity).catch((error) =>
+          this.logger.warn(`Vector update failed for ${id}:`, error),
+        );
+        this.updateGraphNode(entity).catch((error) =>
+          this.logger.warn(`Graph update failed for ${id}:`, error),
+        );
       }
 
-      return updatedEntity;
+      return entity;
     } catch (error) {
-      this.logger.error(`Failed to update knowledge entity: ${id}`, error);
+      this.logger.error(`Failed to update knowledge entity ${id}:`, error);
       throw error;
     }
   }
 
   async remove(id: KnowledgeEntity['id']): Promise<void> {
     try {
-      // Get entity details before deletion
-      const entity = await this.findById(id);
-
-      if (!entity) {
-        this.logger.warn(`Knowledge entity not found for deletion: ${id}`);
-        return;
-      }
-
-      // 1. Remove from MongoDB
       await this.mongoRepository.remove(id);
-      this.logger.log(`Knowledge entity removed from MongoDB: ${id}`);
 
-      // 2. Remove from Weaviate
-      try {
-        await this.vectorRepository.deleteKnowledgeVector(id);
-        this.logger.log(`Knowledge vector removed from Weaviate: ${id}`);
-      } catch (vectorError) {
-        this.logger.error(
-          `Failed to remove knowledge vector: ${id}`,
-          vectorError,
+      // Cleanup vector and graph asynchronously
+      this.vectorRepository
+        .deleteKnowledgeVector(id)
+        .catch((error) =>
+          this.logger.warn(`Vector cleanup failed for ${id}:`, error),
         );
-      }
-
-      // 3. Remove from Neo4j
-      try {
-        await this.graphRepository.deleteEntity(id);
-        this.logger.log(`Knowledge entity removed from Neo4j: ${id}`);
-      } catch (graphError) {
-        this.logger.error(
-          `Failed to remove knowledge entity from Neo4j: ${id}`,
-          graphError,
+      this.graphRepository
+        .deleteEntity(id)
+        .catch((error) =>
+          this.logger.warn(`Graph cleanup failed for ${id}:`, error),
         );
-      }
     } catch (error) {
-      this.logger.error(`Failed to remove knowledge entity: ${id}`, error);
+      this.logger.error(`Failed to remove knowledge entity ${id}:`, error);
       throw error;
     }
   }
 
-  async findSimilar(
-    vector: number[],
-    limit: number = 10,
-  ): Promise<KnowledgeEntity[]> {
+  // ===== SHOPPING-FOCUSED QUERIES =====
+  async findByType(type: KnowledgeEntity['type']): Promise<KnowledgeEntity[]> {
+    return this.mongoRepository.findByType(type);
+  }
+
+  async findByName(name: string): Promise<KnowledgeEntity[]> {
+    return this.mongoRepository.findByName(name);
+  }
+
+  async findByCategory(category: string): Promise<KnowledgeEntity[]> {
+    return this.mongoRepository.findByProperties({ category });
+  }
+
+  async findByBrand(brand: string): Promise<KnowledgeEntity[]> {
+    return this.mongoRepository.findByProperties({ brand });
+  }
+
+  // ===== RAG OPERATIONS (SEMANTIC SEARCH) =====
+  async findSimilar(vector: number[], limit = 10): Promise<KnowledgeEntity[]> {
     try {
-      // Use Weaviate for vector similarity search
       return await this.vectorRepository.findSimilarKnowledge(vector, limit);
     } catch (error) {
-      this.logger.error('Failed to find similar knowledge entities:', error);
+      this.logger.error('Semantic similarity search failed:', error);
       return [];
     }
   }
 
-  async findByProperties(
-    properties: Record<string, any>,
-  ): Promise<KnowledgeEntity[]> {
+  async semanticSearch(query: string, limit = 10): Promise<KnowledgeEntity[]> {
     try {
-      // Use MongoDB for property-based queries
-      return await this.mongoRepository.findByProperties(properties);
-    } catch (error) {
-      this.logger.error(
-        'Failed to find knowledge entities by properties:',
-        error,
-      );
-      return [];
-    }
-  }
-
-  // Hybrid-specific methods
-  async semanticKnowledgeSearch(
-    query: string,
-    limit: number = 10,
-  ): Promise<KnowledgeEntity[]> {
-    try {
-      // Use Weaviate for semantic search
       return await this.vectorRepository.semanticKnowledgeSearch(query, limit);
     } catch (error) {
-      this.logger.error('Failed to perform semantic knowledge search:', error);
+      this.logger.error('Semantic search failed:', error);
       return [];
     }
   }
 
-  async findRelatedKnowledge(
-    entityId: string,
-    hops: number = 2,
-  ): Promise<KnowledgeEntity[]> {
+  // ===== KAG OPERATIONS (GRAPH RELATIONSHIPS) =====
+  async findRelated(entityId: string, hops = 2): Promise<KnowledgeEntity[]> {
     try {
-      // Use Neo4j for graph traversal
       const relatedEntities = await this.graphRepository.findRelatedEntities(
         entityId,
         hops,
       );
 
-      // Optionally enrich with MongoDB data for complete entity information
+      // Enrich with full entity data from MongoDB
       const enrichedEntities: KnowledgeEntity[] = [];
       for (const entity of relatedEntities) {
         const fullEntity = await this.mongoRepository.findById(entity.id);
@@ -227,111 +152,92 @@ export class HybridKnowledgeRepository implements KnowledgeRepository {
 
       return enrichedEntities;
     } catch (error) {
-      this.logger.error('Failed to find related knowledge:', error);
+      this.logger.error('Graph relationship search failed:', error);
       return [];
     }
   }
 
-  async getKnowledgeGraph(entityId: string): Promise<any> {
+  async findRecommendations(
+    entityId: string,
+    limit = 5,
+  ): Promise<KnowledgeEntity[]> {
     try {
-      const result: any = {};
+      const entity = await this.findById(entityId);
+      if (!entity) return [];
 
-      // 1. Get the main entity from MongoDB
-      const entity = await this.mongoRepository.findById(entityId);
-      if (!entity) {
-        return null;
-      }
-      result.entity = entity;
+      const recommendations: KnowledgeEntity[] = [];
 
-      // 2. Get relationships from Neo4j
-      try {
-        const relationships =
-          await this.graphRepository.findEntityRelationships(entityId);
-        result.relationships = relationships;
-      } catch (graphError) {
-        this.logger.error(
-          `Failed to get relationships for entity: ${entityId}`,
-          graphError,
+      // 1. Get graph-based recommendations (KAG)
+      const relatedEntities = await this.findRelated(entityId, 1);
+      recommendations.push(...relatedEntities.slice(0, Math.floor(limit / 2)));
+
+      // 2. Get vector-based recommendations (RAG)
+      if (entity.vector && entity.vector.length > 0) {
+        const similarEntities = await this.findSimilar(
+          entity.vector,
+          Math.ceil(limit / 2),
         );
-        result.relationships = [];
+        recommendations.push(
+          ...similarEntities.filter((e) => e.id !== entityId),
+        );
       }
 
-      // 3. Get related entities from graph
-      try {
-        const relatedEntities = await this.graphRepository.findRelatedEntities(
-          entityId,
-          2,
-        );
-        result.relatedEntities = relatedEntities;
-      } catch (graphError) {
-        this.logger.error(
-          `Failed to get related entities for: ${entityId}`,
-          graphError,
-        );
-        result.relatedEntities = [];
-      }
-
-      // 4. Get similar entities from vector search
-      try {
-        if (entity.vector && entity.vector.length > 0) {
-          const similarEntities =
-            await this.vectorRepository.findSimilarKnowledge(entity.vector, 5);
-          result.similarEntities = similarEntities.filter(
-            (e) => e.id !== entityId,
-          );
-        } else {
-          result.similarEntities = [];
-        }
-      } catch (vectorError) {
-        this.logger.error(
-          `Failed to get similar entities for: ${entityId}`,
-          vectorError,
-        );
-        result.similarEntities = [];
-      }
-
-      return result;
-    } catch (error) {
-      this.logger.error(
-        `Failed to get knowledge graph for: ${entityId}`,
-        error,
+      // Remove duplicates and limit results
+      const uniqueRecommendations = recommendations.filter(
+        (item, index, self) =>
+          index === self.findIndex((e) => e.id === item.id),
       );
-      return null;
+
+      return uniqueRecommendations.slice(0, limit);
+    } catch (error) {
+      this.logger.error('Recommendation generation failed:', error);
+      return [];
     }
   }
 
-  async hybridKnowledgeSearch(
+  // ===== HYBRID SEARCH (RAG + KAG) =====
+  async hybridSearch(
     query: string,
     filters: Record<string, any> = {},
   ): Promise<KnowledgeEntity[]> {
     try {
       const results: KnowledgeEntity[] = [];
 
-      // 1. Semantic search from Weaviate
-      const semanticResults = await this.vectorRepository.hybridKnowledgeSearch(
-        query,
-        filters,
-      );
+      // 1. RAG: Semantic search using vectors
+      const semanticResults = await this.semanticSearch(query, 15);
       results.push(...semanticResults);
 
-      // 2. If we have type filter, also search by type in MongoDB
+      // 2. Traditional text search in MongoDB
       if (filters.type) {
-        const typeResults = await this.mongoRepository.findByType(filters.type);
-        const filteredTypeResults = typeResults.filter(
+        const typeResults = await this.findByType(filters.type);
+        const filteredResults = typeResults.filter(
           (entity) =>
             entity.name.toLowerCase().includes(query.toLowerCase()) ||
             entity.description.toLowerCase().includes(query.toLowerCase()),
         );
-        results.push(...filteredTypeResults);
+        results.push(...filteredResults);
       }
 
-      // 3. Remove duplicates based on ID
-      const uniqueResults = results.filter(
+      // 3. Apply additional filters
+      let filteredResults = results;
+      if (filters.category) {
+        filteredResults = results.filter(
+          (entity) => entity.properties?.category === filters.category,
+        );
+      }
+      if (filters.brand) {
+        filteredResults = results.filter(
+          (entity) => entity.properties?.brand === filters.brand,
+        );
+      }
+
+      // Remove duplicates
+      const uniqueResults = filteredResults.filter(
         (entity, index, self) =>
           index === self.findIndex((e) => e.id === entity.id),
       );
 
-      // 4. Sort by relevance (entities with vectors first, then by name)
+      // Sort by relevance (entities with vectors first)
       uniqueResults.sort((a, b) => {
         if (a.vector && !b.vector) return -1;
         if (!a.vector && b.vector) return 1;
@@ -339,265 +245,45 @@ export class HybridKnowledgeRepository implements KnowledgeRepository {
       });
 
       this.logger.log(
-        `Hybrid search returned ${uniqueResults.length} results for query: ${query}`,
+        `Hybrid search returned ${uniqueResults.length} results for: ${query}`,
       );
-      return uniqueResults;
+      return uniqueResults.slice(0, 20); // Limit to top 20 results
     } catch (error) {
-      this.logger.error('Failed to perform hybrid knowledge search:', error);
+      this.logger.error('Hybrid search failed:', error);
       return [];
     }
   }
 
-  async findKnowledgePath(
-    fromEntityId: string,
-    toEntityId: string,
-  ): Promise<any[]> {
+  // ===== PRIVATE HELPER METHODS =====
+  private async storeVector(entity: KnowledgeEntity): Promise<void> {
     try {
-      // Use Neo4j for path finding
-      return await this.graphRepository.findShortestPath(
-        fromEntityId,
-        toEntityId,
-      );
+      await this.vectorRepository.storeKnowledgeVector(entity);
+      this.logger.debug(`Vector stored for entity: ${entity.id}`);
     } catch (error) {
-      this.logger.error('Failed to find knowledge path:', error);
-      return [];
+      this.logger.error(`Vector storage failed for ${entity.id}:`, error);
     }
   }
 
-  async getEntityRecommendations(
-    entityId: string,
-    limit: number = 5,
-  ): Promise<KnowledgeEntity[]> {
+  private async createGraphNode(entity: KnowledgeEntity): Promise<void> {
     try {
-      const recommendations: KnowledgeEntity[] = [];
+      await this.graphRepository.createKnowledgeEntity(entity);
+      this.logger.debug(`Graph node created for entity: ${entity.id}`);
+    } catch (error) {
+      this.logger.error(`Graph node creation failed for ${entity.id}:`, error);
+    }
+  }
 
-      // 1. Get similar entities from vector search
-      const entity = await this.mongoRepository.findById(entityId);
-      if (entity && entity.vector && entity.vector.length > 0) {
-        const similarEntities =
-          await this.vectorRepository.findSimilarKnowledge(
-            entity.vector,
-            limit,
-          );
-        recommendations.push(
-          ...similarEntities.filter((e) => e.id !== entityId),
+  private async updateGraphNode(entity: KnowledgeEntity): Promise<void> {
+    try {
+      if (entity.properties) {
+        await this.graphRepository.updateEntityProperties(
+          entity.id,
+          entity.properties,
         );
+        this.logger.debug(`Graph node updated for entity: ${entity.id}`);
       }
-
-      // 2. Get related entities from graph
-      const relatedEntities = await this.graphRepository.findRelatedEntities(
-        entityId,
-        2,
-      );
-      recommendations.push(...relatedEntities.filter((e) => e.id !== entityId));
-
-      // 3. Get entities of the same type
-      if (entity) {
-        const sameTypeEntities = await this.mongoRepository.findByType(
-          entity.type,
-        );
-        recommendations.push(
-          ...sameTypeEntities.filter((e) => e.id !== entityId),
-        );
-      }
-
-      // 4. Remove duplicates and limit results
-      const uniqueRecommendations = recommendations.filter(
-        (entity, index, self) =>
-          index === self.findIndex((e) => e.id === entity.id),
-      );
-
-      // 5. Sort by relevance and limit
-      uniqueRecommendations.sort((a, b) => {
-        // Prioritize entities with vectors (more semantic information)
-        if (a.vector && !b.vector) return -1;
-        if (!a.vector && b.vector) return 1;
-        return a.name.localeCompare(b.name);
-      });
-
-      const limitedRecommendations = uniqueRecommendations.slice(0, limit);
-      this.logger.log(
-        `Generated ${limitedRecommendations.length} recommendations for entity: ${entityId}`,
-      );
-
-      return limitedRecommendations;
     } catch (error) {
-      this.logger.error('Failed to get entity recommendations:', error);
-      return [];
-    }
-  }
-
-  // Additional utility methods for comprehensive knowledge management
-  async bulkCreate(
-    entities: Omit<KnowledgeEntity, 'id'>[],
-  ): Promise<KnowledgeEntity[]> {
-    try {
-      const createdEntities: KnowledgeEntity[] = [];
-
-      // Create in MongoDB first
-      for (const entityData of entities) {
-        const createdEntity = await this.mongoRepository.create(entityData);
-        createdEntities.push(createdEntity);
-      }
-
-      // Batch operations for better performance
-      try {
-        await this.graphRepository.createEntitiesBatch(createdEntities);
-        this.logger.log(
-          `Batch created ${createdEntities.length} entities in Neo4j`,
-        );
-      } catch (graphError) {
-        this.logger.error(
-          'Failed to batch create entities in Neo4j:',
-          graphError,
-        );
-      }
-
-      // Store vectors in Weaviate
-      for (const entity of createdEntities) {
-        try {
-          await this.vectorRepository.storeKnowledgeVector(entity);
-        } catch (vectorError) {
-          this.logger.error(
-            `Failed to store vector for entity: ${entity.id}`,
-            vectorError,
-          );
-        }
-      }
-
-      return createdEntities;
-    } catch (error) {
-      this.logger.error('Failed to bulk create knowledge entities:', error);
-      throw error;
-    }
-  }
-
-  async findInfluentialEntities(
-    entityType: string,
-    limit: number = 10,
-  ): Promise<any[]> {
-    try {
-      // Use Neo4j for influence analysis
-      return await this.graphRepository.findInfluentialEntities(
-        entityType,
-        limit,
-      );
-    } catch (error) {
-      this.logger.error('Failed to find influential entities:', error);
-      return [];
-    }
-  }
-
-  async getKnowledgeStats(): Promise<any> {
-    try {
-      const stats: any = {};
-
-      // Get basic stats from MongoDB
-      try {
-        const mongoStats = await this.mongoRepository.getKnowledgeStats?.();
-        stats.mongodb = mongoStats;
-      } catch (mongoError) {
-        this.logger.error('Failed to get MongoDB stats:', mongoError);
-      }
-
-      // Get graph stats from Neo4j
-      try {
-        const graphStats = await this.graphRepository.getKnowledgeGraphStats();
-        stats.neo4j = graphStats;
-      } catch (graphError) {
-        this.logger.error('Failed to get Neo4j stats:', graphError);
-      }
-
-      // Get vector stats from Weaviate
-      try {
-        const vectorStats = await this.vectorRepository.getVectorStats?.();
-        stats.weaviate = vectorStats;
-      } catch (vectorError) {
-        this.logger.error('Failed to get Weaviate stats:', vectorError);
-      }
-
-      return stats;
-    } catch (error) {
-      this.logger.error('Failed to get knowledge stats:', error);
-      return {};
-    }
-  }
-
-  async findConceptualConnections(
-    concept1: string,
-    concept2: string,
-    maxHops: number = 5,
-  ): Promise<any[]> {
-    try {
-      // Use Neo4j for conceptual path finding
-      return await this.graphRepository.findConceptualPaths(
-        concept1,
-        concept2,
-        maxHops,
-      );
-    } catch (error) {
-      this.logger.error('Failed to find conceptual connections:', error);
-      return [];
-    }
-  }
-
-  async getEntityClusters(entityType: string): Promise<any[]> {
-    try {
-      // Use Neo4j for clustering analysis
-      return await this.graphRepository.findEntityClusters(entityType);
-    } catch (error) {
-      this.logger.error('Failed to get entity clusters:', error);
-      return [];
-    }
-  }
-
-  async findEntitySimilarity(
-    entityId: string,
-    limit: number = 5,
-  ): Promise<any[]> {
-    try {
-      // Use Neo4j for similarity analysis based on graph structure
-      return await this.graphRepository.findEntitySimilarity(entityId, limit);
-    } catch (error) {
-      this.logger.error('Failed to find entity similarity:', error);
-      return [];
-    }
-  }
-
-  async searchKnowledgeByContent(
-    content: string,
-    limit: number = 10,
-  ): Promise<KnowledgeEntity[]> {
-    try {
-      const results: KnowledgeEntity[] = [];
-
-      // 1. Semantic search from Weaviate
-      const semanticResults =
-        await this.vectorRepository.semanticKnowledgeSearch(
-          content,
-          Math.floor(limit / 2),
-        );
-      results.push(...semanticResults);
-
-      // 2. Text search from MongoDB
-      const textResults = await this.mongoRepository.searchByContent?.(
-        content,
-        Math.floor(limit / 2),
-      );
-      if (textResults) {
-        results.push(...textResults);
-      }
-
-      // Remove duplicates
-      const uniqueResults = results.filter(
-        (entity, index, self) =>
-          index === self.findIndex((e) => e.id === entity.id),
-      );
-
-      return uniqueResults.slice(0, limit);
-    } catch (error) {
-      this.logger.error('Failed to search knowledge by content:', error);
-      return [];
+      this.logger.error(`Graph node update failed for ${entity.id}:`, error);
     }
   }
 }

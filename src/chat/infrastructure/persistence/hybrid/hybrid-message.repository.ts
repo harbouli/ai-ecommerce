@@ -1,4 +1,3 @@
-// src/chat/infrastructure/persistence/hybrid/hybrid-message.repository.ts
 import { Injectable, Logger } from '@nestjs/common';
 import { Message } from '../../../domain/message';
 import { MessageRepository } from '../message.repository';

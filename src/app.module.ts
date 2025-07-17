@@ -25,6 +25,7 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { MongooseConfigService } from './database/mongoose-config.service';
 import { ProductsModule } from './products/products.module';
 import { AIModule } from './ai/ai.module';
+import { ChatModule } from './chat/chat.module';
 
 const infrastructureDatabaseModule = MongooseModule.forRootAsync({
   useClass: MongooseConfigService,
@@ -71,6 +72,7 @@ const infrastructureDatabaseModule = MongooseModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
     }),
+    ChatModule,
     UsersModule,
     AIModule,
     FilesModule,

@@ -1,8 +1,10 @@
+// src/chat/infrastructure/persistence/document/entities/knowledge.schema.ts
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import mongoose, { now, HydratedDocument } from 'mongoose';
 import { EntityDocumentHelper } from '../../../../../utils/document-entity-helper';
 
 export type KnowledgeSchemaDocument = HydratedDocument<KnowledgeSchemaClass>;
+export type KnowledgeDocument = KnowledgeSchemaDocument; // Alias for backward compatibility
 
 @Schema({
   timestamps: true,
@@ -64,4 +66,6 @@ KnowledgeSchema.index({ type: 1, name: 1 });
 KnowledgeSchema.index({ name: 'text', description: 'text' });
 KnowledgeSchema.index({ createdAt: -1 });
 KnowledgeSchema.index({ 'properties.category': 1 });
+KnowledgeSchema.index({ 'properties.brand': 1 });
+KnowledgeSchema.index({ 'properties.price': 1 });
 KnowledgeSchema.index({ vector: 1 });
