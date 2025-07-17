@@ -15,8 +15,8 @@ export class ProductDocumentRepository implements ProductRepository {
     private readonly productModel: Model<ProductSchemaClass>,
   ) {}
 
-  async create(data: Product): Promise<Product> {
-    const persistenceModel = ProductMapper.toPersistence(data);
+  async create(data: Omit<Product, 'id'>): Promise<Product> {
+    const persistenceModel = ProductMapper.toPersistence({ ...data, id: '' });
     const createdEntity = new this.productModel(persistenceModel);
     const entityObject = await createdEntity.save();
     return ProductMapper.toDomain(entityObject);

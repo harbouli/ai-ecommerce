@@ -3,7 +3,7 @@ import { Product } from '../../../../domain/product';
 import { ProductSchemaClass } from '../entities/product.schema';
 
 export class ProductMapper {
-  public static toDomain(raw: ProductSchemaClass): Product {
+  public static toDomain(raw: Omit<ProductSchemaClass, 'id'>): Product {
     const domainEntity = new Product();
 
     domainEntity.stock = raw.stock;

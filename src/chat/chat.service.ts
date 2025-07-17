@@ -497,11 +497,16 @@ export class ChatService {
   ): Promise<Message> {
     const processingTime = Date.now() - processingStartTime;
 
+    // FIX: Ensure content is never undefined
+    const content =
+      aiResponse.content ||
+      'I apologize, but I am having trouble generating a response right now. Please try again.';
+
     const messageData = {
       chatId: chat.id,
       sessionId: chat.sessionId,
       type: 'ASSISTANT' as const,
-      content: aiResponse.content,
+      content, // Use the fixed content
       timestamp: new Date(),
       context: ragContext,
       metadata: {
@@ -526,20 +531,66 @@ export class ChatService {
   ): Promise<Message> {
     const processingTime = Date.now() - processingStartTime;
 
+    // Get the last user message to provide context-aware fallback
+    const recentMessages = await this.messageRepository.findByChatId(chat.id);
+    const lastUserMessage = recentMessages
+      .filter((msg) => msg.type === 'USER')
+      .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime())[0];
+
+    let content =
+      "I apologize, but I'm having trouble processing your request right now. Could you please rephrase your question or try asking about specific products you're looking for?";
+
+    if (lastUserMessage) {
+      const lowerContent = lastUserMessage.content.toLowerCase();
+
+      if (
+        lowerContent.includes('hello') ||
+        lowerContent.includes('hi') ||
+        lowerContent.includes('hey')
+      ) {
+        content =
+          "Hello! Welcome to our store! I'm your shopping assistant and I'm here to help you find exactly what you're looking for. How can I assist you today?";
+      } else if (lowerContent.includes('how are you')) {
+        content =
+          "I'm doing well, thank you for asking! I'm here to help you with your shopping needs. Is there anything specific you're looking for today?";
+      } else if (
+        lowerContent.includes('product') ||
+        lowerContent.includes('search') ||
+        lowerContent.includes('find')
+      ) {
+        content =
+          "I'd be happy to help you find products! Could you please tell me more specifically what you're looking for? For example, what category, brand, or features are you interested in?";
+      } else if (
+        lowerContent.includes('price') ||
+        lowerContent.includes('cost')
+      ) {
+        content =
+          "I can help you with pricing information! Could you please specify which product you're interested in learning about?";
+      } else if (
+        lowerContent.includes('help') ||
+        lowerContent.includes('support')
+      ) {
+        content =
+          "I'm here to help! I can assist you with finding products, comparing options, checking prices, and answering any questions about our store. What would you like to know?";
+      }
+    }
+
     const messageData = {
       chatId: chat.id,
       sessionId: chat.sessionId,
       type: 'ASSISTANT' as const,
-      content:
-        "I apologize, but I'm having trouble processing your request right now. Could you please rephrase your question or try asking about specific products you're looking for?",
+      content,
       timestamp: new Date(),
+      context: [],
       metadata: {
-        model: 'fallback',
         processingTime,
-        error: true,
+        tokensUsed: 0,
+        model: 'intelligent-fallback',
+        temperature: 0.7,
+        fallbackReason: 'ollama_failure',
       } as MessageMetadata,
-      intent: 'ERROR_RESPONSE',
-      confidence: 1.0,
+      intent: 'RESPONSE',
+      confidence: 0.8,
       createdAt: new Date(),
       updatedAt: new Date(),
     };

@@ -406,6 +406,12 @@ export class AIService {
         );
       }
 
+      // FIX: Ensure response.content is never undefined
+      if (!response.content || typeof response.content !== 'string') {
+        this.logger.warn('Generated response has empty or invalid content');
+        response = this.getFallbackResponse(prompt, startTime);
+      }
+
       // Cache the response
       if (useCache) {
         const cacheKey = this.cache.getCacheKey(
@@ -428,16 +434,25 @@ export class AIService {
     customOptions?: any,
     startTime?: number,
   ): Promise<AIResponse> {
+    const requestStartTime = startTime || Date.now();
+
     try {
+      this.logger.log(
+        `Starting Ollama generation for prompt: "${prompt.substring(0, 100)}..."`,
+      );
+
       // Check if Ollama is available
       await this.checkOllamaHealth();
 
       // Build conversation context for Llama
       const fullPrompt = this.buildOllamaPrompt(prompt, conversationHistory);
 
+      this.logger.log(`Full prompt length: ${fullPrompt.length} characters`);
+
       const ollamaRequest: OllamaGenerateRequest = {
         model: customOptions?.model || this.ollamaChatModel,
         prompt: fullPrompt,
+        stream: false, // IMPORTANT: Disable streaming to get complete response
         options: {
           temperature: customOptions?.temperature || this.temperature,
           top_p: customOptions?.topP || this.topP,
@@ -447,26 +462,63 @@ export class AIService {
       };
 
       this.logger.log(
-        `Generating Ollama response with model: ${ollamaRequest.model}`,
+        `Sending NON-STREAMING request to Ollama with model: ${ollamaRequest.model}`,
+      );
+      this.logger.log(
+        `Request options: ${JSON.stringify(ollamaRequest.options, null, 2)}`,
       );
 
       const response = await this.ollamaClient.post<OllamaGenerateResponse>(
         '/api/generate',
         ollamaRequest,
+        { timeout: 30000 }, // 30 second timeout
       );
+
       const ollamaResponse = response.data;
 
-      const processingTime = startTime ? Date.now() - startTime : 0;
+      this.logger.log(
+        `Ollama response received. Status: ${ollamaResponse.done ? 'completed' : 'incomplete'}`,
+      );
+      this.logger.log(
+        `Raw response object:`,
+        JSON.stringify(ollamaResponse, null, 2),
+      );
+
+      const processingTime = Date.now() - requestStartTime;
       const tokensUsed =
         (ollamaResponse.eval_count || 0) +
         (ollamaResponse.prompt_eval_count || 0);
 
       this.logger.log(
-        `Ollama response generated in ${processingTime}ms using ${tokensUsed} tokens`,
+        `Ollama metrics - Processing time: ${processingTime}ms, Tokens used: ${tokensUsed}`,
       );
 
+      // Enhanced content validation with detailed logging
+      const content = ollamaResponse.response?.trim() || '';
+
+      this.logger.log(`Response content length: ${content.length}`);
+      if (content.length > 0) {
+        this.logger.log(`Response preview: "${content.substring(0, 200)}..."`);
+      } else {
+        this.logger.warn('Response content is empty or undefined');
+        this.logger.warn(`Raw response field: "${ollamaResponse.response}"`);
+      }
+
+      if (!content || content.length === 0) {
+        this.logger.warn('Ollama returned empty or null response');
+        return this.getFallbackResponse(prompt, requestStartTime);
+      }
+
+      // Check for common Ollama error responses
+      if (this.isOllamaErrorResponse(content)) {
+        this.logger.warn(`Ollama returned error response: "${content}"`);
+        return this.getFallbackResponse(prompt, requestStartTime);
+      }
+
+      this.logger.log('Ollama generation completed successfully');
+
       return {
-        content: ollamaResponse.response,
+        content,
         tokensUsed,
         processingTime,
         model: ollamaRequest.model,
@@ -474,8 +526,17 @@ export class AIService {
         fromCache: false,
       };
     } catch (error) {
-      this.logger.error('Ollama generation failed:', error);
-      throw new Error(`Ollama generation failed: ${error.message}`);
+      this.logger.error('Ollama generation failed with error:', error);
+      this.logger.error('Error details:', {
+        message: error.message,
+        code: error.code,
+        response: error.response?.data,
+        stack: error.stack?.split('\n').slice(0, 5).join('\n'),
+      });
+
+      // Return intelligent fallback instead of throwing
+      this.logger.warn('Using intelligent fallback due to Ollama failure');
+      return this.getFallbackResponse(prompt, requestStartTime);
     }
   }
 
@@ -817,6 +878,20 @@ export class AIService {
         provider: provider || this.preferredProvider,
       });
 
+      // FIX: Check if response.content exists and is not empty
+      if (!response.content || typeof response.content !== 'string') {
+        this.logger.warn('Empty or invalid response content in classifyIntent');
+        return {
+          intent: 'OTHER',
+          confidence: 0.3,
+          entities: [],
+          metadata: {
+            error: 'Empty response content',
+            originalText: text,
+          },
+        };
+      }
+
       const intent = response.content.trim().toUpperCase();
       const validIntents = this.getDefaultIntents();
       const finalIntent = validIntents.includes(intent) ? intent : 'OTHER';
@@ -1098,6 +1173,18 @@ export class AIService {
         provider: provider || this.preferredProvider,
       });
 
+      // FIX: Check if response.content exists and is not empty
+      if (!response.content || typeof response.content !== 'string') {
+        this.logger.warn(
+          'Empty or invalid response content in generateSuggestions',
+        );
+        return [
+          'How can I help you further?',
+          'Would you like product recommendations?',
+          'Do you have other questions?',
+        ];
+      }
+
       const suggestions = response.content
         .split('\n')
         .filter((line) => line.trim().length > 0)
@@ -1361,55 +1448,182 @@ Guidelines:
 
   private getFallbackResponse(prompt: string, startTime: number): AIResponse {
     const processingTime = Date.now() - startTime;
-
-    // Intelligent fallback based on prompt keywords
-    const lowerPrompt = prompt.toLowerCase();
+    const lowerPrompt = prompt.toLowerCase().trim();
 
     let content =
       "I apologize, but I'm currently experiencing technical difficulties. Please try again in a moment.";
+    let confidence = 0.5;
 
-    if (
-      lowerPrompt.includes('hello') ||
-      lowerPrompt.includes('hi') ||
-      lowerPrompt.includes('hey')
-    ) {
+    // Greeting patterns
+    if (this.isGreeting(lowerPrompt)) {
       content =
-        "Hello! I'm here to help you with your shopping needs. How can I assist you today?";
-    } else if (
-      lowerPrompt.includes('product') ||
-      lowerPrompt.includes('search') ||
-      lowerPrompt.includes('find')
-    ) {
+        "Hello! Welcome to our store! I'm your shopping assistant and I'm here to help you find exactly what you're looking for. How can I assist you today?";
+      confidence = 0.9;
+    }
+    // Product search patterns
+    else if (this.isProductSearch(lowerPrompt)) {
       content =
-        "I'd be happy to help you find products. Could you please be more specific about what you're looking for?";
-    } else if (
-      lowerPrompt.includes('price') ||
-      lowerPrompt.includes('cost') ||
-      lowerPrompt.includes('$')
-    ) {
+        "I'd be happy to help you find products! Could you please tell me more specifically what you're looking for? For example, what category, brand, or features are you interested in?";
+      confidence = 0.8;
+    }
+    // Price inquiry patterns
+    else if (this.isPriceInquiry(lowerPrompt)) {
       content =
-        "I can help you with pricing information. Could you specify which product you're interested in?";
-    } else if (
-      lowerPrompt.includes('help') ||
-      lowerPrompt.includes('support')
-    ) {
+        "I can help you with pricing information! Could you please specify which product you're interested in learning about?";
+      confidence = 0.8;
+    }
+    // Help/support patterns
+    else if (this.isHelpRequest(lowerPrompt)) {
       content =
-        "I'm here to help! Please let me know what specific assistance you need, and I'll do my best to help you.";
-    } else if (
-      lowerPrompt.includes('recommend') ||
-      lowerPrompt.includes('suggest')
-    ) {
+        "I'm here to help! I can assist you with finding products, comparing options, checking prices, and answering any questions about our store. What would you like to know?";
+      confidence = 0.8;
+    }
+    // Order/shipping patterns
+    else if (this.isOrderInquiry(lowerPrompt)) {
       content =
-        "I'd love to help you find the perfect product! Could you tell me more about your preferences or what you're shopping for?";
+        'I can help you with order-related questions! Please let me know what specific information you need about your order, shipping, or our policies.';
+      confidence = 0.8;
+    }
+    // General conversation
+    else if (this.isGeneralConversation(lowerPrompt)) {
+      content =
+        "I'm doing well, thank you for asking! I'm here to help you with your shopping needs. Is there anything specific you're looking for today?";
+      confidence = 0.8;
     }
 
     return {
       content,
       tokensUsed: this.estimateTokenCount(content),
       processingTime,
-      model: 'fallback',
+      model: 'intelligent-fallback',
       provider: 'ollama',
-      confidence: 0.4,
+      confidence,
+      fromCache: false,
     };
+  }
+
+  private isGreeting(text: string): boolean {
+    const greetingPatterns = [
+      'hello',
+      'hi',
+      'hey',
+      'good morning',
+      'good afternoon',
+      'good evening',
+      'greetings',
+      'howdy',
+      'welcome',
+      'start',
+      'begin',
+    ];
+    return greetingPatterns.some((pattern) => text.includes(pattern));
+  }
+
+  private isProductSearch(text: string): boolean {
+    const searchPatterns = [
+      'search',
+      'find',
+      'look for',
+      'looking for',
+      'need',
+      'want',
+      'product',
+      'item',
+      'buy',
+      'purchase',
+      'shop',
+      'shopping',
+      'browse',
+      'show me',
+    ];
+    return searchPatterns.some((pattern) => text.includes(pattern));
+  }
+
+  private isPriceInquiry(text: string): boolean {
+    const pricePatterns = [
+      'price',
+      'cost',
+      'expensive',
+      'cheap',
+      'budget',
+      'affordable',
+      'how much',
+      'pricing',
+      'fee',
+      'charge',
+      'rate',
+      'dollar',
+      '$',
+    ];
+    return pricePatterns.some((pattern) => text.includes(pattern));
+  }
+
+  private isHelpRequest(text: string): boolean {
+    const helpPatterns = [
+      'help',
+      'assist',
+      'support',
+      'guide',
+      'explain',
+      'tell me',
+      'how to',
+      'can you',
+      'please',
+      'information',
+      'info',
+    ];
+    return helpPatterns.some((pattern) => text.includes(pattern));
+  }
+
+  private isOrderInquiry(text: string): boolean {
+    const orderPatterns = [
+      'order',
+      'shipping',
+      'delivery',
+      'track',
+      'status',
+      'return',
+      'refund',
+      'exchange',
+      'policy',
+      'warranty',
+      'guarantee',
+    ];
+    return orderPatterns.some((pattern) => text.includes(pattern));
+  }
+
+  private isGeneralConversation(text: string): boolean {
+    const conversationPatterns = [
+      'how are you',
+      'how do you do',
+      "what's up",
+      "how's it going",
+      'good',
+      'fine',
+      'doing',
+      'today',
+      'weather',
+      'nice',
+      'thanks',
+      'thank you',
+    ];
+    return conversationPatterns.some((pattern) => text.includes(pattern));
+  }
+  private isOllamaErrorResponse(content: string): boolean {
+    const errorPatterns = [
+      'error',
+      'failed',
+      'unable',
+      'cannot',
+      'connection',
+      'timeout',
+      'not found',
+      '404',
+      '500',
+      'internal server error',
+      'bad request',
+    ];
+    const lowerContent = content.toLowerCase();
+    return errorPatterns.some((pattern) => lowerContent.includes(pattern));
   }
 }

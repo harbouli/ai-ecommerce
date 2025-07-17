@@ -6,7 +6,6 @@ import { IPaginationOptions } from '../../../../utils/types/pagination-options';
 import { ProductDocumentRepository } from '../document/repositories/product.repository';
 import { ProductWeaviateRepository } from '../weaviate/repositories/product.repository';
 import { ProductGraphRepository } from '../graph/repositories/product-graph.repository';
-import { v4 as uuidv4 } from 'uuid';
 
 @Injectable()
 export class HybridProductRepository implements ProductRepository {
@@ -26,7 +25,6 @@ export class HybridProductRepository implements ProductRepository {
       const now = new Date();
       const createdProduct = await this.mongoRepository.create({
         ...data,
-        id: uuidv4(),
         createdAt: now,
         updatedAt: now,
       });
