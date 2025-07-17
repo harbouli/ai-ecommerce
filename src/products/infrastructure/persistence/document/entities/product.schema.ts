@@ -13,44 +13,60 @@ export type ProductSchemaDocument = HydratedDocument<ProductSchemaClass>;
 })
 export class ProductSchemaClass extends EntityDocumentHelper {
   @Prop({
-    type: Date,
+    type: String,
+    required: true,
+    index: true,
   })
-  expiresAt?: Date | null;
-
-  @Prop({
-    type: Date,
-  })
-  publishedAt?: Date | null;
+  name: string;
 
   @Prop({
     type: String,
   })
-  metaDescription?: string | null;
+  description?: string | null;
+
+  // ADD THIS MISSING FIELD
+  @Prop({
+    type: String,
+    index: true,
+  })
+  slug?: string | null;
+
+  @Prop({
+    type: Number,
+    required: true,
+    min: 0,
+  })
+  price: number;
+
+  @Prop({
+    type: Number,
+    min: 0,
+  })
+  costPrice?: number | null;
+
+  @Prop({
+    type: Number,
+    min: 0,
+  })
+  salePrice?: number | null;
+
+  @Prop({
+    type: Number,
+    min: 0,
+    default: 0,
+  })
+  stock?: number | null;
+
+  @Prop({
+    type: Number,
+    min: 0,
+  })
+  weight?: number | null;
 
   @Prop({
     type: String,
   })
-  metaTitle?: string | null;
-
-  @Prop({
-    type: Boolean,
-  })
-  isDigital?: boolean;
-
-  @Prop({
-    type: Boolean,
-  })
-  isFeatured?: boolean;
-
-  @Prop({
-    type: Boolean,
-  })
-  isActive?: boolean;
-
-  @Prop({
-    type: String,
-  })
-  size?: string | null;
+  dimensions?: string | null;
 
   @Prop({
     type: String,
@@ -60,42 +76,64 @@ export class ProductSchemaClass extends EntityDocumentHelper {
   @Prop({
     type: String,
   })
-  dimensions?: string | null;
+  size?: string | null;
 
   @Prop({
-    type: Number,
+    type: Boolean,
+    default: true,
   })
-  weight?: number | null;
+  isActive?: boolean;
 
   @Prop({
-    type: Number,
+    type: Boolean,
+    default: false,
   })
-  stock?: number | null;
+  isFeatured?: boolean;
 
   @Prop({
-    type: Number,
+    type: Boolean,
+    default: false,
   })
-  salePrice?: number | null;
-
-  @Prop({
-    type: Number,
-  })
-  costPrice?: number | null;
-
-  @Prop({
-    type: Number,
-  })
-  price: number;
+  isDigital?: boolean;
 
   @Prop({
     type: String,
   })
-  description?: string | null;
+  metaTitle?: string | null;
 
   @Prop({
     type: String,
   })
-  name: string;
+  metaDescription?: string | null;
+
+  @Prop({
+    type: Date,
+  })
+  publishedAt?: Date | null;
+
+  @Prop({
+    type: Date,
+  })
+  expiresAt?: Date | null;
+
+  // ADD THESE MISSING FIELDS FOR NEO4J SUPPORT
+  @Prop({
+    type: String,
+    index: true,
+  })
+  category?: string | null;
+
+  @Prop({
+    type: String,
+    index: true,
+  })
+  brand?: string | null;
+
+  @Prop({
+    type: [String],
+    default: [],
+  })
+  tags?: string[];
 
   @Prop({ default: now })
   createdAt: Date;
@@ -105,3 +143,11 @@ export class ProductSchemaClass extends EntityDocumentHelper {
 }
 
 export const ProductSchema = SchemaFactory.createForClass(ProductSchemaClass);
+
+// Create indexes for better query performance
+ProductSchema.index({ name: 'text', description: 'text' });
+ProductSchema.index({ category: 1, brand: 1 });
+ProductSchema.index({ price: 1 });
+ProductSchema.index({ isActive: 1, isFeatured: 1 });
+ProductSchema.index({ tags: 1 });
+ProductSchema.index({ createdAt: -1 });

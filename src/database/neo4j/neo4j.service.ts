@@ -133,36 +133,50 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  // Product-specific methods
   async createProductNode(
     product: ProductGraphNode,
   ): Promise<ProductGraphNode> {
+    // Step 1: Create the product node WITHOUT category/brand properties
+    // We'll create relationships separately to avoid parameter errors
     const query = `
-      CREATE (p:Product {
-        id: $id,
-        name: $name,
-        description: $description,
-        price: $price,
-        category: $category,
-        brand: $brand,
-        tags: $tags,
-        createdAt: datetime($createdAt),
-        updatedAt: datetime($updatedAt)
-      })
-      RETURN p
-    `;
+    CREATE (p:Product {
+      id: $id,
+      name: $name,
+      description: $description,
+      price: $price,
+      createdAt: datetime($createdAt),
+      updatedAt: datetime($updatedAt)
+    })
+    RETURN p
+  `;
 
-    const result = await this.runQuery(query, {
+    const parameters = {
       id: product.id,
       name: product.name,
-      description: product.description,
+      description: product.description || null,
       price: product.price,
-      category: product.category,
-      brand: product.brand,
-      tags: product.tags || [],
       createdAt: product.createdAt.toISOString(),
       updatedAt: product.updatedAt.toISOString(),
-    });
+    };
+
+    const result = await this.runQuery(query, parameters);
+
+    // Step 2: Create Category node and relationship if category exists
+    if (product.category) {
+      await this.createCategoryIfNotExists(product.category);
+      await this.linkProductToCategory(product.id, product.category);
+    }
+
+    // Step 3: Create Brand node and relationship if brand exists
+    if (product.brand) {
+      await this.createBrandIfNotExists(product.brand);
+      await this.linkProductToBrand(product.id, product.brand);
+    }
+
+    // Step 4: Create Tag nodes and relationships if tags exist
+    if (product.tags && product.tags.length > 0) {
+      await this.addProductTags(product.id, product.tags);
+    }
 
     return result[0]?.p.properties;
   }
@@ -272,22 +286,22 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
 
   async createCategoryIfNotExists(categoryName: string): Promise<void> {
     const query = `
-      MERGE (c:Category {name: $categoryName})
-      RETURN c
-    `;
+    MERGE (c:Category {name: $categoryName})
+    RETURN c
+  `;
 
     await this.runQuery(query, { categoryName });
   }
-
   async linkProductToCategory(
     productId: string,
     categoryName: string,
   ): Promise<void> {
     const query = `
-      MATCH (p:Product {id: $productId})
-      MERGE (c:Category {name: $categoryName})
-      MERGE (p)-[:BELONGS_TO]->(c)
-    `;
+    MATCH (p:Product {id: $productId})
+    MATCH (c:Category {name: $categoryName})
+    MERGE (p)-[:BELONGS_TO]->(c)
+    RETURN p, c
+  `;
 
     await this.runQuery(query, { productId, categoryName });
   }
@@ -306,23 +320,27 @@ export class Neo4jService implements OnModuleInit, OnModuleDestroy {
     brandName: string,
   ): Promise<void> {
     const query = `
-      MATCH (p:Product {id: $productId})
-      MERGE (b:Brand {name: $brandName})
-      MERGE (p)-[:MADE_BY]->(b)
-    `;
+    MATCH (p:Product {id: $productId})
+    MATCH (b:Brand {name: $brandName})
+    MERGE (p)-[:MADE_BY]->(b)
+    RETURN p, b
+  `;
 
     await this.runQuery(query, { productId, brandName });
   }
 
   async addProductTags(productId: string, tags: string[]): Promise<void> {
-    for (const tag of tags) {
-      const query = `
-        MATCH (p:Product {id: $productId})
-        MERGE (t:Tag {name: $tag})
-        MERGE (p)-[:TAGGED_WITH]->(t)
-      `;
+    if (!tags || tags.length === 0) return;
 
-      await this.runQuery(query, { productId, tag });
+    for (const tagName of tags) {
+      const query = `
+      MATCH (p:Product {id: $productId})
+      MERGE (t:Tag {name: $tagName})
+      MERGE (p)-[:TAGGED_WITH]->(t)
+      RETURN p, t
+    `;
+
+      await this.runQuery(query, { productId, tagName });
     }
   }
 

@@ -33,24 +33,22 @@ export class ProductGraphRepository implements ProductRepository {
         updatedAt: now,
       };
 
+      // The Neo4jService.createProductNode now handles category, brand, and tags internally
+      // So we don't need to call these methods again here
       await this.neo4jService.createProductNode(graphNode);
 
-      // Create category relationship if provided
-      if (data.category) {
-        await this.neo4jService.createCategoryIfNotExists(data.category);
-        await this.neo4jService.linkProductToCategory(productId, data.category);
-      }
-
-      // Create brand relationship if provided
-      if (data.brand) {
-        await this.neo4jService.createBrandIfNotExists(data.brand);
-        await this.neo4jService.linkProductToBrand(productId, data.brand);
-      }
-
-      // Add tags if provided
-      if (data.tags && data.tags.length > 0) {
-        await this.neo4jService.addProductTags(productId, data.tags);
-      }
+      // ❌ REMOVE THESE DUPLICATE CALLS (now handled inside createProductNode):
+      // if (data.category) {
+      //   await this.neo4jService.createCategoryIfNotExists(data.category);
+      //   await this.neo4jService.linkProductToCategory(productId, data.category);
+      // }
+      // if (data.brand) {
+      //   await this.neo4jService.createBrandIfNotExists(data.brand);
+      //   await this.neo4jService.linkProductToBrand(productId, data.brand);
+      // }
+      // if (data.tags && data.tags.length > 0) {
+      //   await this.neo4jService.addProductTags(productId, data.tags);
+      // }
 
       this.logger.log(`Product created in Neo4j with ID: ${productId}`);
       return this.mapGraphNodeToDomain({ ...graphNode, id: productId });
@@ -304,6 +302,13 @@ export class ProductGraphRepository implements ProductRepository {
     product.description = graphNode.description || null;
     product.slug = this.generateSlug(graphNode.name);
     product.price = graphNode.price;
+
+    // ✅ ADD THESE MISSING FIELD MAPPINGS:
+    product.category = graphNode.category || null;
+    product.brand = graphNode.brand || null;
+    product.tags = graphNode.tags || [];
+
+    // Set defaults for fields not stored in Neo4j
     product.costPrice = null;
     product.salePrice = null;
     product.stock = null;

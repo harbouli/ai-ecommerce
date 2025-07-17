@@ -395,7 +395,6 @@ export class ChatService {
     try {
       // 1. Analyze the user's message
       const analysis = await this.aiService.analyzeQuery(userMessage.content);
-      console.log('🚀 ~ ChatService ~ analysis:', analysis);
 
       // 2. Extract entities and update user message
       await this.messageRepository.update(userMessage.id, {
@@ -409,6 +408,7 @@ export class ChatService {
         userMessage.content,
         5,
       );
+      console.log('🚀 ~ ChatService ~ ragContext:', ragContext);
 
       // 4. Get KAG context (knowledge graph relationships)
       const kagContext = await this.kagService.getContextualKnowledge(
@@ -497,7 +497,6 @@ export class ChatService {
   ): Promise<Message> {
     const processingTime = Date.now() - processingStartTime;
 
-    // FIX: Ensure content is never undefined
     const content =
       aiResponse.content ||
       'I apologize, but I am having trouble generating a response right now. Please try again.';
@@ -506,7 +505,7 @@ export class ChatService {
       chatId: chat.id,
       sessionId: chat.sessionId,
       type: 'ASSISTANT' as const,
-      content, // Use the fixed content
+      content,
       timestamp: new Date(),
       context: ragContext,
       metadata: {
