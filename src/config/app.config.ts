@@ -7,6 +7,7 @@ import {
   IsString,
   ValidateNested,
   IsNotEmpty,
+  IsEnum,
 } from 'class-validator';
 import { Type, Transform } from 'class-transformer';
 import validateConfig from '../utils/validate-config';
@@ -71,6 +72,23 @@ class EnvironmentVariablesValidator {
   @IsString()
   @IsOptional()
   API_PREFIX: string;
+
+  @IsEnum(['gemini', 'ollama', 'auto'])
+  @IsOptional()
+  AI_PREFERRED_PROVIDER: 'gemini' | 'ollama' | 'auto';
+
+  // Ollama Configuration
+  @IsString()
+  @IsOptional()
+  OLLAMA_BASE_URL: string;
+
+  @IsString()
+  @IsOptional()
+  OLLAMA_CHAT_MODEL: string;
+
+  @IsString()
+  @IsOptional()
+  OLLAMA_EMBEDDING_MODEL: string;
 
   @IsString()
   @IsOptional()
@@ -179,6 +197,18 @@ export default registerAs<AppConfig>('app', () => {
       topK: process.env.GEMINI_TOP_K
         ? parseInt(process.env.GEMINI_TOP_K, 10)
         : 40,
+    },
+
+    ai: {
+      preferredProvider:
+        (process.env.AI_PREFERRED_PROVIDER as 'gemini' | 'ollama' | 'auto') ||
+        'ollama',
+    },
+    ollama: {
+      baseUrl: process.env.OLLAMA_BASE_URL || 'http://localhost:11434',
+      chatModel: process.env.OLLAMA_CHAT_MODEL || 'llama3.2:latest',
+      embeddingModel:
+        process.env.OLLAMA_EMBEDDING_MODEL || 'nomic-embed-text:latest',
     },
   };
 });

@@ -16,6 +16,15 @@ export type AppConfig = {
   headerLanguage: string;
   neo4j: Neo4jConfig;
 
+  ollama: {
+    baseUrl: string;
+    chatModel: string;
+    embeddingModel: string;
+  };
+  ai: {
+    preferredProvider: 'gemini' | 'ollama' | 'auto';
+  };
+
   gemini: {
     apiKey: string;
     model: string;
