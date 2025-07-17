@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-unused-vars */
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Mistral } from '@mistralai/mistralai';
+import { GoogleGenerativeAI, GenerativeModel } from '@google/generative-ai';
 import { AllConfigType } from '../config/config.type';
 
 export interface ChatMessage {
@@ -15,6 +15,7 @@ export interface AIResponse {
   processingTime: number;
   model: string;
   confidence?: number;
+  fromCache?: boolean;
 }
 
 export interface ExtractedEntity {
@@ -54,30 +55,202 @@ export interface EmbeddingResult {
   processingTime: number;
 }
 
+interface CacheEntry {
+  response: any;
+  timestamp: number;
+  ttl: number;
+}
+
+class GeminiRateLimitManager {
+  private requestCounts = new Map<string, number>();
+  private tokenCounts = new Map<string, number>();
+  private dailyRequestCount = 0;
+  private lastResetTime = new Map<string, number>();
+  private lastDailyReset = Date.now();
+
+  private readonly MINUTE_MS = 60 * 1000;
+  private readonly DAY_MS = 24 * 60 * 60 * 1000;
+
+  // Conservative Gemini Free Tier Limits
+  private readonly LIMITS = {
+    requestsPerMinute: 10, // Very conservative (actual: 15)
+    tokensPerMinute: 800, // Conservative for input tokens
+    requestsPerDay: 1000, // Conservative (actual: 1500)
+  };
+
+  canMakeRequest(estimatedTokens: number = 100): {
+    allowed: boolean;
+    reason?: string;
+    waitTime?: number;
+  } {
+    const now = Date.now();
+
+    // Reset daily counter
+    if (now - this.lastDailyReset >= this.DAY_MS) {
+      this.dailyRequestCount = 0;
+      this.lastDailyReset = now;
+    }
+
+    // Check daily limit
+    if (this.dailyRequestCount >= this.LIMITS.requestsPerDay) {
+      return {
+        allowed: false,
+        reason: 'Daily request limit exceeded',
+        waitTime: this.DAY_MS - (now - this.lastDailyReset),
+      };
+    }
+
+    // Reset minute counters
+    const requestKey = 'requests_per_minute';
+    const tokenKey = 'tokens_per_minute';
+
+    const lastRequestReset = this.lastResetTime.get(requestKey) || 0;
+    const lastTokenReset = this.lastResetTime.get(tokenKey) || 0;
+
+    if (now - lastRequestReset >= this.MINUTE_MS) {
+      this.requestCounts.set(requestKey, 0);
+      this.lastResetTime.set(requestKey, now);
+    }
+
+    if (now - lastTokenReset >= this.MINUTE_MS) {
+      this.tokenCounts.set(tokenKey, 0);
+      this.lastResetTime.set(tokenKey, now);
+    }
+
+    const currentRequests = this.requestCounts.get(requestKey) || 0;
+    const currentTokens = this.tokenCounts.get(tokenKey) || 0;
+
+    // Check per-minute request limit
+    if (currentRequests >= this.LIMITS.requestsPerMinute) {
+      const waitTime = this.MINUTE_MS - (now - lastRequestReset);
+      return {
+        allowed: false,
+        reason: 'Per-minute request limit exceeded',
+        waitTime,
+      };
+    }
+
+    // Check per-minute token limit
+    if (currentTokens + estimatedTokens > this.LIMITS.tokensPerMinute) {
+      const waitTime = this.MINUTE_MS - (now - lastTokenReset);
+      return {
+        allowed: false,
+        reason: 'Per-minute token limit exceeded',
+        waitTime,
+      };
+    }
+
+    return { allowed: true };
+  }
+
+  recordRequest(tokensUsed: number = 100): void {
+    const requestKey = 'requests_per_minute';
+    const tokenKey = 'tokens_per_minute';
+
+    const currentRequests = this.requestCounts.get(requestKey) || 0;
+    const currentTokens = this.tokenCounts.get(tokenKey) || 0;
+
+    this.requestCounts.set(requestKey, currentRequests + 1);
+    this.tokenCounts.set(tokenKey, currentTokens + tokensUsed);
+    this.dailyRequestCount++;
+  }
+
+  getStatus() {
+    const now = Date.now();
+    const requestKey = 'requests_per_minute';
+    const tokenKey = 'tokens_per_minute';
+
+    return {
+      requestsThisMinute: this.requestCounts.get(requestKey) || 0,
+      tokensThisMinute: this.tokenCounts.get(tokenKey) || 0,
+      requestsToday: this.dailyRequestCount,
+      limits: this.LIMITS,
+    };
+  }
+}
+
+class SimpleCache {
+  private cache = new Map<string, CacheEntry>();
+  private readonly DEFAULT_TTL = 5 * 60 * 1000; // 5 minutes
+
+  set(key: string, value: any, ttl: number = this.DEFAULT_TTL): void {
+    this.cache.set(key, {
+      response: value,
+      timestamp: Date.now(),
+      ttl,
+    });
+  }
+
+  get(key: string): any | null {
+    const entry = this.cache.get(key);
+    if (!entry) return null;
+
+    if (Date.now() - entry.timestamp > entry.ttl) {
+      this.cache.delete(key);
+      return null;
+    }
+
+    return entry.response;
+  }
+
+  clear(): void {
+    this.cache.clear();
+  }
+
+  private generateKey(input: string, type: string): string {
+    // Simple hash function for cache key
+    let hash = 0;
+    for (let i = 0; i < input.length; i++) {
+      const char = input.charCodeAt(i);
+      hash = (hash << 5) - hash + char;
+      hash = hash & hash; // Convert to 32-bit integer
+    }
+    return `${type}_${Math.abs(hash)}`;
+  }
+
+  getCacheKey(input: string, type: string): string {
+    return this.generateKey(input.substring(0, 200), type); // Limit input length for key
+  }
+}
+
 @Injectable()
 export class AIService {
   private readonly logger = new Logger(AIService.name);
-  private readonly mistralClient: Mistral;
+  private readonly geminiClient: GoogleGenerativeAI;
+  private readonly rateLimitManager = new GeminiRateLimitManager();
+  private readonly cache = new SimpleCache();
   private readonly model: string;
   private readonly embeddingModel: string;
   private readonly temperature: number;
   private readonly maxTokens: number;
+  private readonly topP: number;
+  private readonly topK: number;
 
   constructor(private readonly configService: ConfigService<AllConfigType>) {
-    this.mistralClient = new Mistral({
-      apiKey: this.configService.get('app.mistral.apiKey', { infer: true }),
-    });
+    const apiKey = this.configService.get('app.gemini.apiKey', { infer: true });
+    if (!apiKey) {
+      throw new Error('Gemini API key is not configured');
+    }
 
+    this.geminiClient = new GoogleGenerativeAI(apiKey);
+
+    // Use Flash model for better rate limits and lower cost
     this.model =
-      this.configService.get('app.mistral.model', { infer: true }) ||
-      'mistral-large-latest';
+      this.configService.get('app.gemini.model', { infer: true }) ||
+      'gemini-1.5-flash';
     this.embeddingModel =
-      this.configService.get('app.mistral.embeddingModel', { infer: true }) ||
-      'mistral-embed';
+      this.configService.get('app.gemini.embeddingModel', { infer: true }) ||
+      'text-embedding-004';
     this.temperature =
-      this.configService.get('app.mistral.temperature', { infer: true }) || 0.7;
+      this.configService.get('app.gemini.temperature', { infer: true }) || 0.7;
     this.maxTokens =
-      this.configService.get('app.mistral.maxTokens', { infer: true }) || 1000;
+      this.configService.get('app.gemini.maxTokens', { infer: true }) || 500; // Reduced for free tier
+    this.topP =
+      this.configService.get('app.gemini.topP', { infer: true }) || 0.95;
+    this.topK =
+      this.configService.get('app.gemini.topK', { infer: true }) || 40;
+
+    this.logger.log(`Gemini AI Service initialized with model: ${this.model}`);
   }
 
   async generateResponse(
@@ -87,63 +260,201 @@ export class AIService {
       temperature?: number;
       maxTokens?: number;
       model?: string;
+      topP?: number;
+      topK?: number;
+      useCache?: boolean;
     },
   ): Promise<AIResponse> {
     const startTime = Date.now();
+    const useCache = customOptions?.useCache !== false;
 
     try {
-      const messages = [
-        {
-          role: 'system' as const,
-          content: this.getSystemPrompt(),
-        },
-        ...(conversationHistory || []),
-        {
-          role: 'user' as const,
-          content: prompt,
-        },
-      ];
+      // Check cache first
+      if (useCache) {
+        const cacheKey = this.cache.getCacheKey(prompt, 'response');
+        const cachedResponse = this.cache.get(cacheKey);
+        if (cachedResponse) {
+          this.logger.log('Returning cached response');
+          return {
+            ...cachedResponse,
+            fromCache: true,
+            processingTime: Date.now() - startTime,
+          };
+        }
+      }
+
+      // Estimate token usage
+      const estimatedTokens =
+        this.estimateTokenCount(prompt) +
+        (conversationHistory?.length || 0) * 50;
+
+      // Check rate limits
+      const rateLimitCheck =
+        this.rateLimitManager.canMakeRequest(estimatedTokens);
+
+      if (!rateLimitCheck.allowed) {
+        this.logger.warn(`Rate limit exceeded: ${rateLimitCheck.reason}`);
+        return this.getRateLimitResponse(rateLimitCheck, startTime);
+      }
+
+      const modelName = customOptions?.model || this.model;
+      const generativeModel: GenerativeModel =
+        this.geminiClient.getGenerativeModel({
+          model: modelName,
+          generationConfig: {
+            temperature: customOptions?.temperature || this.temperature,
+            maxOutputTokens: Math.min(
+              customOptions?.maxTokens || this.maxTokens,
+              500,
+            ),
+            topP: customOptions?.topP || this.topP,
+            topK: customOptions?.topK || this.topK,
+          },
+          systemInstruction: this.getSystemPrompt(),
+        });
+
+      // Optimize prompt to reduce token usage
+      let optimizedPrompt = this.optimizePrompt(prompt);
+
+      if (conversationHistory && conversationHistory.length > 0) {
+        // Limit conversation history to last 2 exchanges to save tokens
+        const recentHistory = conversationHistory
+          .filter((msg) => msg.role !== 'system')
+          .slice(-2)
+          .map(
+            (msg) =>
+              `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content.substring(0, 200)}`,
+          )
+          .join('\n');
+        optimizedPrompt = `${recentHistory}\nUser: ${optimizedPrompt}`;
+      }
 
       this.logger.log(
         `Generating response for prompt: ${prompt.substring(0, 100)}...`,
       );
 
-      const response = await this.mistralClient.chat.complete({
-        model: customOptions?.model || this.model,
-        messages,
-        temperature: customOptions?.temperature || this.temperature,
-        maxTokens: customOptions?.maxTokens || this.maxTokens,
-      });
+      const result = await generativeModel.generateContent(optimizedPrompt);
+      const response = await result.response;
+      const content = response.text();
 
       const processingTime = Date.now() - startTime;
-      const rawContent = response.choices[0]?.message?.content;
-      const content = Array.isArray(rawContent)
-        ? rawContent
-            .map((chunk) =>
-              typeof chunk === 'string'
-                ? chunk
-                : chunk.type === 'text'
-                  ? chunk.text
-                  : '',
-            )
-            .join('')
-        : rawContent || '';
-      const tokensUsed = response.usage?.totalTokens || 0;
+      const tokensUsed = this.estimateTokenCount(content + optimizedPrompt);
+
+      // Record the request
+      this.rateLimitManager.recordRequest(tokensUsed);
+
+      const aiResponse: AIResponse = {
+        content,
+        tokensUsed,
+        processingTime,
+        model: modelName,
+        fromCache: false,
+      };
+
+      // Cache the response
+      if (useCache) {
+        const cacheKey = this.cache.getCacheKey(prompt, 'response');
+        this.cache.set(cacheKey, aiResponse, 5 * 60 * 1000); // 5 minutes cache
+      }
 
       this.logger.log(
         `Response generated in ${processingTime}ms using ${tokensUsed} tokens`,
       );
 
-      return {
-        content,
-        tokensUsed,
-        processingTime,
-        model: customOptions?.model || this.model,
-      };
+      return aiResponse;
     } catch (error) {
       this.logger.error('Error generating response:', error);
-      throw new Error(`Failed to generate AI response: ${error.message}`);
+
+      if (this.isRateLimitError(error)) {
+        return this.getRateLimitResponse(
+          {
+            allowed: false,
+            reason: 'API rate limit exceeded',
+            waitTime: 60000,
+          },
+          startTime,
+        );
+      }
+
+      return this.getFallbackResponse(prompt, startTime);
     }
+  }
+
+  private optimizePrompt(prompt: string): string {
+    // Truncate very long prompts to save tokens
+    if (prompt.length > 1000) {
+      return prompt.substring(0, 1000) + '...';
+    }
+    return prompt;
+  }
+
+  private getRateLimitResponse(
+    rateLimitInfo: any,
+    startTime: number,
+  ): AIResponse {
+    const waitMinutes = Math.ceil((rateLimitInfo.waitTime || 60000) / 60000);
+    const content = `I'm currently managing my response rate to provide the best service. Please wait about ${waitMinutes} minute(s) before trying again, or try a shorter, more specific question.`;
+
+    return {
+      content,
+      tokensUsed: this.estimateTokenCount(content),
+      processingTime: Date.now() - startTime,
+      model: 'rate-limited',
+      confidence: 0.5,
+    };
+  }
+
+  private getFallbackResponse(prompt: string, startTime: number): AIResponse {
+    const processingTime = Date.now() - startTime;
+
+    // Intelligent fallback based on prompt keywords
+    const lowerPrompt = prompt.toLowerCase();
+
+    let content =
+      "I apologize, but I'm currently experiencing technical difficulties. Please try again in a moment.";
+
+    if (
+      lowerPrompt.includes('hello') ||
+      lowerPrompt.includes('hi') ||
+      lowerPrompt.includes('hey')
+    ) {
+      content =
+        "Hello! I'm here to help you with your shopping needs. How can I assist you today?";
+    } else if (
+      lowerPrompt.includes('product') ||
+      lowerPrompt.includes('search') ||
+      lowerPrompt.includes('find')
+    ) {
+      content =
+        "I'd be happy to help you find products. Could you please be more specific about what you're looking for?";
+    } else if (
+      lowerPrompt.includes('price') ||
+      lowerPrompt.includes('cost') ||
+      lowerPrompt.includes('$')
+    ) {
+      content =
+        "I can help you with pricing information. Could you specify which product you're interested in?";
+    } else if (
+      lowerPrompt.includes('help') ||
+      lowerPrompt.includes('support')
+    ) {
+      content =
+        "I'm here to help! Please let me know what specific assistance you need, and I'll do my best to help you.";
+    } else if (
+      lowerPrompt.includes('recommend') ||
+      lowerPrompt.includes('suggest')
+    ) {
+      content =
+        "I'd love to help you find the perfect product! Could you tell me more about your preferences or what you're shopping for?";
+    }
+
+    return {
+      content,
+      tokensUsed: this.estimateTokenCount(content),
+      processingTime,
+      model: 'fallback',
+      confidence: 0.4,
+    };
   }
 
   async generateEmbedding(
@@ -153,80 +464,70 @@ export class AIService {
     const startTime = Date.now();
 
     try {
-      this.logger.log(
-        `Generating embedding for text: ${text.substring(0, 100)}...`,
-      );
+      // Check cache first
+      const cacheKey = this.cache.getCacheKey(text, 'embedding');
+      const cachedEmbedding = this.cache.get(cacheKey);
+      if (cachedEmbedding) {
+        this.logger.log('Returning cached embedding');
+        return cachedEmbedding;
+      }
 
-      const response = await this.mistralClient.embeddings.create({
-        model: customModel || this.embeddingModel,
-        inputs: [text],
+      // Check rate limits
+      const estimatedTokens = this.estimateTokenCount(text);
+      const rateLimitCheck =
+        this.rateLimitManager.canMakeRequest(estimatedTokens);
+
+      if (!rateLimitCheck.allowed) {
+        this.logger.warn('Rate limit exceeded for embedding generation');
+        throw new Error('Rate limit exceeded');
+      }
+
+      const modelName = customModel || this.embeddingModel;
+      const embeddingModel = this.geminiClient.getGenerativeModel({
+        model: modelName,
       });
 
-      const processingTime = Date.now() - startTime;
-      const vector = response.data[0]?.embedding || [];
+      // Truncate text if too long
+      const truncatedText = text.substring(0, 1000);
 
-      if (!vector || vector.length === 0) {
+      const result = await embeddingModel.embedContent(truncatedText);
+      const embedding = result.embedding;
+
+      if (!embedding || !embedding.values || embedding.values.length === 0) {
         throw new Error('Failed to generate embedding: empty vector received');
       }
 
-      this.logger.log(
-        `Embedding generated in ${processingTime}ms with ${vector.length} dimensions`,
-      );
+      const processingTime = Date.now() - startTime;
+      this.rateLimitManager.recordRequest(estimatedTokens);
 
-      return {
-        vector,
-        dimensions: vector.length,
-        model: customModel || this.embeddingModel,
+      const embeddingResult: EmbeddingResult = {
+        vector: embedding.values,
+        dimensions: embedding.values.length,
+        model: modelName,
         processingTime,
       };
-    } catch (error) {
-      this.logger.error('Error generating embedding:', error);
-      throw new Error(`Failed to generate embedding: ${error.message}`);
-    }
-  }
 
-  async generateMultipleEmbeddings(
-    texts: string[],
-    customModel?: string,
-  ): Promise<EmbeddingResult[]> {
-    const startTime = Date.now();
-
-    try {
-      this.logger.log(`Generating embeddings for ${texts.length} texts`);
-
-      const response = await this.mistralClient.embeddings.create({
-        model: customModel || this.embeddingModel,
-        inputs: texts,
-      });
-
-      const processingTime = Date.now() - startTime;
-
-      const results: EmbeddingResult[] = response.data.map((item, index) => {
-        const embedding = item.embedding || [];
-        if (!embedding || embedding.length === 0) {
-          throw new Error(
-            `Failed to generate embedding for text ${index}: empty vector received`,
-          );
-        }
-
-        return {
-          vector: embedding,
-          dimensions: embedding.length,
-          model: customModel || this.embeddingModel,
-          processingTime: processingTime / texts.length, // Approximate per-text processing time
-        };
-      });
+      // Cache the embedding
+      this.cache.set(cacheKey, embeddingResult, 30 * 60 * 1000); // 30 minutes cache
 
       this.logger.log(
-        `${texts.length} embeddings generated in ${processingTime}ms`,
+        `Embedding generated in ${processingTime}ms with ${embedding.values.length} dimensions`,
       );
 
-      return results;
+      return embeddingResult;
     } catch (error) {
-      this.logger.error('Error generating multiple embeddings:', error);
-      throw new Error(
-        `Failed to generate multiple embeddings: ${error.message}`,
-      );
+      this.logger.error('Error generating embedding:', error);
+
+      // Return a simple fallback embedding
+      const fallbackVector = new Array(768)
+        .fill(0)
+        .map(() => Math.random() - 0.5);
+      return {
+        vector: fallbackVector,
+        dimensions: fallbackVector.length,
+        model: 'fallback',
+        processingTime: Date.now() - startTime,
+      };
     }
   }
 
@@ -234,136 +535,85 @@ export class AIService {
     text: string,
     customIntents?: string[],
   ): Promise<IntentClassification> {
-    const startTime = Date.now();
-
     try {
-      const intents = customIntents || this.getDefaultIntents();
+      // Simple, token-efficient intent classification
+      const shortPrompt = `Intent for "${text.substring(0, 100)}"? Options: ${this.getDefaultIntents().slice(0, 7).join(', ')}. Answer with one word.`;
 
-      const prompt = `
-      Classify the intent of the following user message into one of these categories:
-      ${intents.map((intent) => `- ${intent}`).join('\n')}
+      const response = await this.generateResponse(shortPrompt, undefined, {
+        maxTokens: 20,
+        useCache: true,
+      });
 
-      User message: "${text}"
-      
-      Respond with a JSON object containing:
-      - intent: the classified intent
-      - confidence: confidence score (0-1)
-      - reasoning: brief explanation of the classification
-      
-      Example: {"intent": "PRODUCT_SEARCH", "confidence": 0.95, "reasoning": "User is looking for specific products"}
-      `;
+      const intent = response.content.trim().toUpperCase();
+      const validIntents = this.getDefaultIntents();
+      const finalIntent = validIntents.includes(intent) ? intent : 'OTHER';
 
-      const response = await this.generateResponse(prompt);
-
-      try {
-        const parsed = JSON.parse(response.content);
-
-        const processingTime = Date.now() - startTime;
-
-        this.logger.log(
-          `Intent classified as '${parsed.intent}' with confidence ${parsed.confidence} in ${processingTime}ms`,
-        );
-
-        return {
-          intent: parsed.intent,
-          confidence: parsed.confidence || 0.8,
-          entities: [], // Will be populated by extractEntities if needed
-          metadata: {
-            reasoning: parsed.reasoning,
-            processingTime,
-            originalText: text,
-          },
-        };
-      } catch (parseError) {
-        this.logger.warn(
-          'Failed to parse intent classification JSON, using fallback',
-        );
-
-        return {
-          intent: 'OTHER',
-          confidence: 0.5,
-          entities: [],
-          metadata: {
-            reasoning: 'Failed to parse AI response',
-            processingTime: Date.now() - startTime,
-            originalText: text,
-            rawResponse: response.content,
-          },
-        };
-      }
+      return {
+        intent: finalIntent,
+        confidence: response.fromCache ? 0.9 : 0.8,
+        entities: [],
+        metadata: {
+          processingTime: response.processingTime,
+          originalText: text,
+          fromCache: response.fromCache,
+        },
+      };
     } catch (error) {
       this.logger.error('Error classifying intent:', error);
-      throw new Error(`Failed to classify intent: ${error.message}`);
+      return {
+        intent: 'OTHER',
+        confidence: 0.3,
+        entities: [],
+        metadata: { error: error.message, originalText: text },
+      };
     }
   }
 
-  async extractEntities(
+  extractEntities(
     text: string,
     customEntityTypes?: string[],
-  ): Promise<ExtractedEntity[]> {
-    const startTime = Date.now();
-
+  ): ExtractedEntity[] {
     try {
-      const entityTypes = customEntityTypes || this.getDefaultEntityTypes();
+      // Use pattern matching for basic entity extraction to save tokens
+      const entities: ExtractedEntity[] = [];
 
-      const prompt = `
-      Extract entities from the following text and categorize them.
-      
-      Entity types to extract:
-      ${entityTypes.map((type) => `- ${type}`).join('\n')}
-
-      Text: "${text}"
-      
-      Respond with a JSON array of entities:
-      [
-        {
-          "text": "entity_text",
-          "type": "ENTITY_TYPE",
-          "confidence": 0.95,
-          "startIndex": 0,
-          "endIndex": 10,
-          "context": "surrounding context"
-        }
-      ]
-      
-      Only return valid JSON array, no other text.
-      `;
-
-      const response = await this.generateResponse(prompt);
-
-      try {
-        const entities = JSON.parse(response.content);
-        const processingTime = Date.now() - startTime;
-
-        const extractedEntities: ExtractedEntity[] = entities.map(
-          (entity: any) => ({
-            text: entity.text,
-            type: entity.type,
-            confidence: entity.confidence || 0.8,
-            startIndex: entity.startIndex || 0,
-            endIndex: entity.endIndex || entity.text.length,
-            metadata: {
-              context: entity.context,
-              processingTime,
-              originalText: text,
-            },
-          }),
-        );
-
-        this.logger.log(
-          `Extracted ${extractedEntities.length} entities in ${processingTime}ms`,
-        );
-
-        return extractedEntities;
-      } catch (parseError) {
-        this.logger.warn(
-          'Failed to parse entities JSON, returning empty array',
-        );
-        return [];
+      // Price patterns
+      const priceMatches = text.match(/\$[\d,]+\.?\d*/g);
+      if (priceMatches) {
+        priceMatches.forEach((match) => {
+          const startIndex = text.indexOf(match);
+          entities.push({
+            text: match,
+            type: 'PRICE',
+            confidence: 0.9,
+            startIndex,
+            endIndex: startIndex + match.length,
+            metadata: { extractionMethod: 'regex' },
+          });
+        });
       }
+
+      // Product/brand patterns (simple capitalized words)
+      const productMatches = text.match(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b/g);
+      if (productMatches) {
+        productMatches.slice(0, 3).forEach((match) => {
+          // Limit to 3 to avoid noise
+          const startIndex = text.indexOf(match);
+          entities.push({
+            text: match,
+            type: 'PRODUCT',
+            confidence: 0.6,
+            startIndex,
+            endIndex: startIndex + match.length,
+            metadata: { extractionMethod: 'regex' },
+          });
+        });
+      }
+
+      return entities;
     } catch (error) {
       this.logger.error('Error extracting entities:', error);
-      throw new Error(`Failed to extract entities: ${error.message}`);
+      return [];
     }
   }
 
@@ -371,54 +621,28 @@ export class AIService {
     text: string,
     maxSentences?: number,
   ): Promise<TextSummary> {
-    const startTime = Date.now();
-
     try {
-      const prompt = `
-      Summarize the following text in ${maxSentences || 3} sentences or less.
-      Also provide:
-      - Key points (3-5 bullet points)
-      - Overall sentiment (positive/negative/neutral)
-      - Confidence score (0-1)
+      const shortPrompt = `Summarize in ${maxSentences || 2} sentences: "${text.substring(0, 300)}"`;
 
-      Text: "${text}"
-      
-      Respond with JSON:
-      {
-        "summary": "brief summary",
-        "keyPoints": ["point 1", "point 2", "point 3"],
-        "sentiment": "positive|negative|neutral",
-        "confidence": 0.95
-      }
-      `;
+      const response = await this.generateResponse(shortPrompt, undefined, {
+        maxTokens: 100,
+        useCache: true,
+      });
 
-      const response = await this.generateResponse(prompt);
-
-      try {
-        const parsed = JSON.parse(response.content);
-        const processingTime = Date.now() - startTime;
-
-        this.logger.log(`Text summarized in ${processingTime}ms`);
-
-        return {
-          summary: parsed.summary,
-          keyPoints: parsed.keyPoints || [],
-          sentiment: parsed.sentiment || 'neutral',
-          confidence: parsed.confidence || 0.8,
-        };
-      } catch (parseError) {
-        this.logger.warn('Failed to parse summary JSON, using fallback');
-
-        return {
-          summary: response.content.substring(0, 200) + '...',
-          keyPoints: [],
-          sentiment: 'neutral',
-          confidence: 0.5,
-        };
-      }
+      return {
+        summary: response.content,
+        keyPoints: [response.content],
+        sentiment: 'neutral',
+        confidence: response.fromCache ? 0.9 : 0.7,
+      };
     } catch (error) {
       this.logger.error('Error summarizing text:', error);
-      throw new Error(`Failed to summarize text: ${error.message}`);
+      return {
+        summary: text.substring(0, 200) + '...',
+        keyPoints: [],
+        sentiment: 'neutral',
+        confidence: 0.3,
+      };
     }
   }
 
@@ -432,92 +656,64 @@ export class AIService {
     targetLanguage: string;
     confidence: number;
   }> {
-    const startTime = Date.now();
-
     try {
-      const prompt = `
-      Translate the following text to ${targetLanguage}.
-      ${sourceLanguage ? `Source language: ${sourceLanguage}` : 'Auto-detect source language.'}
-      
-      Text: "${text}"
-      
-      Respond with JSON:
-      {
-        "translatedText": "translated text here",
-        "sourceLanguage": "detected_language",
-        "targetLanguage": "${targetLanguage}",
-        "confidence": 0.95
-      }
-      `;
+      const shortPrompt = `Translate to ${targetLanguage}: "${text.substring(0, 200)}"`;
 
-      const response = await this.generateResponse(prompt);
+      const response = await this.generateResponse(shortPrompt, undefined, {
+        maxTokens: Math.min(200, text.length * 2),
+        useCache: true,
+      });
 
-      try {
-        const parsed = JSON.parse(response.content);
-        const processingTime = Date.now() - startTime;
-
-        this.logger.log(
-          `Text translated from ${parsed.sourceLanguage} to ${targetLanguage} in ${processingTime}ms`,
-        );
-
-        return {
-          translatedText: parsed.translatedText,
-          sourceLanguage: parsed.sourceLanguage,
-          targetLanguage: parsed.targetLanguage,
-          confidence: parsed.confidence || 0.8,
-        };
-      } catch (parseError) {
-        this.logger.warn('Failed to parse translation JSON, using fallback');
-
-        return {
-          translatedText: response.content,
-          sourceLanguage: sourceLanguage || 'unknown',
-          targetLanguage,
-          confidence: 0.5,
-        };
-      }
+      return {
+        translatedText: response.content,
+        sourceLanguage: sourceLanguage || 'auto-detected',
+        targetLanguage,
+        confidence: response.fromCache ? 0.9 : 0.7,
+      };
     } catch (error) {
       this.logger.error('Error translating text:', error);
-      throw new Error(`Failed to translate text: ${error.message}`);
+      return {
+        translatedText: text,
+        sourceLanguage: sourceLanguage || 'unknown',
+        targetLanguage,
+        confidence: 0.3,
+      };
     }
   }
 
   async generateSuggestions(
     context: string,
-    numberOfSuggestions: number = 5,
+    numberOfSuggestions: number = 3,
   ): Promise<string[]> {
     try {
-      const prompt = `
-      Based on the following context, generate ${numberOfSuggestions} helpful suggestions or follow-up questions that would be relevant to the user.
-      
-      Context: "${context}"
-      
-      Generate suggestions that are:
-      - Relevant to the context
-      - Helpful for the user
-      - Clear and actionable
-      
-      Respond with a JSON array of strings:
-      ["suggestion 1", "suggestion 2", "suggestion 3", ...]
-      `;
+      const shortPrompt = `3 short questions about: "${context.substring(0, 100)}"`;
 
-      const response = await this.generateResponse(prompt);
+      const response = await this.generateResponse(shortPrompt, undefined, {
+        maxTokens: 80,
+        useCache: true,
+      });
 
-      try {
-        const suggestions = JSON.parse(response.content);
+      const suggestions = response.content
+        .split('\n')
+        .filter((line) => line.trim().length > 0)
+        .map((line) => line.replace(/^\d+\.?\s*/, '').trim())
+        .filter((suggestion) => suggestion.length > 0)
+        .slice(0, numberOfSuggestions);
 
-        this.logger.log(`Generated ${suggestions.length} suggestions`);
-
-        return Array.isArray(suggestions) ? suggestions : [];
-      } catch (parseError) {
-        this.logger.warn(
-          'Failed to parse suggestions JSON, returning empty array',
-        );
-        return [];
-      }
+      return suggestions.length > 0
+        ? suggestions
+        : [
+            'Can you tell me more?',
+            'Would you like recommendations?',
+            'Do you need help with anything else?',
+          ];
     } catch (error) {
       this.logger.error('Error generating suggestions:', error);
-      throw new Error(`Failed to generate suggestions: ${error.message}`);
+      return [
+        'How can I help you further?',
+        'Would you like product recommendations?',
+        'Do you have other questions?',
+      ];
     }
   }
 
@@ -532,11 +728,17 @@ export class AIService {
     try {
       this.logger.log(`Analyzing query: ${query.substring(0, 100)}...`);
 
-      const [intent, entities, suggestions] = await Promise.all([
-        this.classifyIntent(query),
-        this.extractEntities(query),
-        this.generateSuggestions(query, 3),
-      ]);
+      // Execute in sequence with delays to respect rate limits
+      const intent = await this.classifyIntent(query);
+
+      // Small delay between requests
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const entities = await this.extractEntities(query);
+
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const suggestions = await this.generateSuggestions(query, 3);
 
       const processingTime = Date.now() - startTime;
 
@@ -550,7 +752,18 @@ export class AIService {
       };
     } catch (error) {
       this.logger.error('Error analyzing query:', error);
-      throw new Error(`Failed to analyze query: ${error.message}`);
+
+      return {
+        intent: {
+          intent: 'OTHER',
+          confidence: 0.3,
+          entities: [],
+          metadata: { error: error.message },
+        },
+        entities: [],
+        suggestions: ['How can I help you?'],
+        processingTime: Date.now() - startTime,
+      };
     }
   }
 
@@ -560,23 +773,22 @@ export class AIService {
     conversationHistory?: ChatMessage[],
   ): Promise<AIResponse> {
     try {
-      const contextSection =
-        context.length > 0
-          ? `
-        Relevant Context:
-        ${context.map((ctx, index) => `${index + 1}. ${ctx}`).join('\n')}
-        `
-          : '';
+      // Optimize context to reduce token usage
+      const limitedContext = context
+        .slice(0, 2)
+        .map((ctx) => ctx.substring(0, 100))
+        .join(' | ');
+      const contextSection = limitedContext
+        ? `Context: ${limitedContext}\n\n`
+        : '';
 
-      const enhancedPrompt = `
-      ${contextSection}
-      
-      User Query: ${query}
-      
-      Please provide a helpful and contextual response based on the information provided above.
-      `;
+      const enhancedPrompt = `${contextSection}User: ${query}`;
 
-      return await this.generateResponse(enhancedPrompt, conversationHistory);
+      return await this.generateResponse(
+        enhancedPrompt,
+        conversationHistory?.slice(-1), // Only keep last exchange
+        { useCache: true },
+      );
     } catch (error) {
       this.logger.error('Error generating contextual response:', error);
       throw new Error(
@@ -585,66 +797,46 @@ export class AIService {
     }
   }
 
+  // Utility methods
+  getRateLimitStatus() {
+    return this.rateLimitManager.getStatus();
+  }
+
+  clearCache() {
+    this.cache.clear();
+    this.logger.log('Cache cleared');
+  }
+
+  private isRateLimitError(error: any): boolean {
+    return (
+      error?.status === 429 ||
+      error?.message?.includes('rate limit') ||
+      error?.message?.includes('quota') ||
+      error?.message?.includes('Too Many Requests')
+    );
+  }
+
   private getSystemPrompt(): string {
-    return `
-    You are an AI assistant for an e-commerce platform. Your role is to:
-    
-    1. Help customers find products they're looking for
-    2. Provide detailed product information and comparisons
-    3. Offer personalized recommendations based on user preferences
-    4. Answer questions about pricing, shipping, and policies
-    5. Assist with order-related inquiries
-    6. Provide excellent customer service
-    
-    Guidelines:
-    - Be friendly, helpful, and professional
-    - Provide accurate information based on the context provided
-    - If you don't have specific information, be honest about it
-    - Suggest relevant products when appropriate
-    - Keep responses concise but informative
-    - Use the knowledge and context provided to give relevant answers
-    - Always prioritize customer satisfaction
-    
-    Current date: ${new Date().toISOString().split('T')[0]}
-    `;
+    return `You are a helpful e-commerce assistant. Be concise and helpful.`;
   }
 
   private getDefaultIntents(): string[] {
     return [
       'PRODUCT_SEARCH',
-      'PRODUCT_QUESTION',
       'PRICE_INQUIRY',
       'RECOMMENDATION',
       'SUPPORT',
       'GREETING',
       'ORDER_STATUS',
-      'SHIPPING_INFO',
-      'RETURN_POLICY',
-      'ACCOUNT_HELP',
-      'COMPLAINT',
-      'COMPLIMENT',
-      'GOODBYE',
       'OTHER',
     ];
   }
 
   private getDefaultEntityTypes(): string[] {
-    return [
-      'PRODUCT',
-      'CATEGORY',
-      'BRAND',
-      'PRICE',
-      'FEATURE',
-      'LOCATION',
-      'PERSON',
-      'DATE',
-      'TIME',
-      'QUANTITY',
-      'SIZE',
-      'COLOR',
-      'MATERIAL',
-      'MODEL',
-      'ORDER_ID',
-    ];
+    return ['PRODUCT', 'CATEGORY', 'BRAND', 'PRICE', 'FEATURE', 'LOCATION'];
+  }
+
+  private estimateTokenCount(text: string): number {
+    return Math.ceil(text.length / 4);
   }
 }

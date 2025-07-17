@@ -1,51 +1,72 @@
 import { registerAs } from '@nestjs/config';
-import { AppConfig } from './app-config.type';
-import validateConfig from '../utils/validate-config';
 import {
-  IsEnum,
-  IsInt,
-  IsNumber,
   IsOptional,
-  IsString,
-  IsUrl,
-  Max,
+  IsInt,
   Min,
+  Max,
+  IsString,
+  ValidateNested,
+  IsNotEmpty,
 } from 'class-validator';
+import { Type, Transform } from 'class-transformer';
+import validateConfig from '../utils/validate-config';
+import { AppConfig } from './app-config.type';
 
-enum Environment {
-  Development = 'development',
-  Production = 'production',
-  Test = 'test',
-}
-enum MistralModel {
-  LARGE = 'mistral-large-latest',
-  SMALL = 'mistral-small-latest',
-  NEMO = 'open-mistral-nemo',
-  MINISTRAL_8B = 'ministral-8b-latest',
-  MINISTRAL_3B = 'ministral-3b-latest',
-  CODESTRAL = 'codestral-latest',
-}
-enum EmbeddingModel {
-  EMBED = 'mistral-embed',
-}
-class EnvironmentVariablesValidator {
-  @IsEnum(Environment)
+class GeminiConfig {
+  @IsString()
+  @IsNotEmpty()
+  apiKey: string;
+
+  @IsString()
   @IsOptional()
-  NODE_ENV: Environment;
+  model: string;
 
+  @IsString()
+  @IsOptional()
+  embeddingModel: string;
+
+  @Transform(({ value }) => parseFloat(value))
+  @IsOptional()
+  @Min(0)
+  @Max(2)
+  temperature: number;
+
+  @Transform(({ value }) => parseInt(value, 10))
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(8192)
+  maxTokens: number;
+
+  @Transform(({ value }) => parseFloat(value))
+  @IsOptional()
+  @Min(0)
+  @Max(1)
+  topP: number;
+
+  @Transform(({ value }) => parseInt(value, 10))
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  topK: number;
+}
+
+class EnvironmentVariablesValidator {
+  @IsString()
+  @IsOptional()
+  NODE_ENV: string;
+
+  @Transform(({ value }) => parseInt(value, 10))
+  @IsOptional()
   @IsInt()
   @Min(0)
   @Max(65535)
-  @IsOptional()
   APP_PORT: number;
 
-  @IsUrl({ require_tld: false })
+  @IsString()
   @IsOptional()
-  FRONTEND_DOMAIN: string;
-
-  @IsUrl({ require_tld: false })
-  @IsOptional()
-  BACKEND_DOMAIN: string;
+  APP_NAME: string;
 
   @IsString()
   @IsOptional()
@@ -59,7 +80,49 @@ class EnvironmentVariablesValidator {
   @IsOptional()
   APP_HEADER_LANGUAGE: string;
 
-  // Neo4j configuration
+  @ValidateNested()
+  @Type(() => GeminiConfig)
+  gemini: GeminiConfig;
+
+  // New Gemini environment variables
+  @IsString()
+  @IsNotEmpty()
+  GEMINI_API_KEY: string;
+
+  @IsString()
+  @IsOptional()
+  GEMINI_MODEL: string;
+
+  @IsString()
+  @IsOptional()
+  GEMINI_EMBEDDING_MODEL: string;
+
+  @Transform(({ value }) => parseFloat(value))
+  @IsOptional()
+  @Min(0)
+  @Max(2)
+  GEMINI_TEMPERATURE: number;
+
+  @Transform(({ value }) => parseInt(value, 10))
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(8192)
+  GEMINI_MAX_TOKENS: number;
+
+  @Transform(({ value }) => parseFloat(value))
+  @IsOptional()
+  @Min(0)
+  @Max(1)
+  GEMINI_TOP_P: number;
+
+  @Transform(({ value }) => parseInt(value, 10))
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  GEMINI_TOP_K: number;
+
   @IsString()
   @IsOptional()
   NEO4J_URI: string;
@@ -71,33 +134,19 @@ class EnvironmentVariablesValidator {
   @IsString()
   @IsOptional()
   NEO4J_PASSWORD: string;
-  @IsString()
-  MISTRAL_API_KEY: string;
-
-  @IsEnum(MistralModel)
-  @IsOptional()
-  MISTRAL_MODEL: MistralModel;
-
-  @IsEnum(EmbeddingModel)
-  @IsOptional()
-  MISTRAL_EMBEDDING_MODEL: EmbeddingModel;
-
-  @IsNumber()
-  @Min(0)
-  @Max(2)
-  @IsOptional()
-  MISTRAL_TEMPERATURE: number;
 }
 
 export default registerAs<AppConfig>('app', () => {
+  console.info('🏗️  Loading App configuration...');
+
   validateConfig(process.env, EnvironmentVariablesValidator);
 
   return {
     nodeEnv: process.env.NODE_ENV || 'development',
-    name: process.env.APP_NAME || 'app',
+    name: process.env.APP_NAME || 'AI E-commerce',
     workingDirectory: process.env.PWD || process.cwd(),
     frontendDomain: process.env.FRONTEND_DOMAIN,
-    backendDomain: process.env.BACKEND_DOMAIN ?? 'http://localhost',
+    backendDomain: process.env.BACKEND_DOMAIN,
     port: process.env.APP_PORT
       ? parseInt(process.env.APP_PORT, 10)
       : process.env.PORT
@@ -106,21 +155,30 @@ export default registerAs<AppConfig>('app', () => {
     apiPrefix: process.env.API_PREFIX || 'api',
     fallbackLanguage: process.env.APP_FALLBACK_LANGUAGE || 'en',
     headerLanguage: process.env.APP_HEADER_LANGUAGE || 'x-custom-lang',
-    // Neo4j configuration
     neo4j: {
       uri: process.env.NEO4J_URI || 'bolt://localhost:7687',
       username: process.env.NEO4J_USERNAME || 'neo4j',
       password: process.env.NEO4J_PASSWORD || 'password',
     },
-    mistral: {
-      apiKey: process.env.MISTRAL_API_KEY || '',
-      model: process.env.MISTRAL_MODEL || MistralModel.LARGE,
+
+    // Gemini configuration
+    gemini: {
+      apiKey: process.env.GEMINI_API_KEY || '',
+      model: process.env.GEMINI_MODEL || 'gemini-1.5-pro',
       embeddingModel:
-        process.env.MISTRAL_EMBEDDING_MODEL || EmbeddingModel.EMBED,
-      temperature: process.env.MISTRAL_TEMPERATURE
-        ? process.env.MISTRAL_TEMPERATURE
-        : '0.7',
-      maxTokens: process.env.MISTRAL_MAX_TOKENS || '1000',
+        process.env.GEMINI_EMBEDDING_MODEL || 'text-embedding-004',
+      temperature: process.env.GEMINI_TEMPERATURE
+        ? parseFloat(process.env.GEMINI_TEMPERATURE)
+        : 0.7,
+      maxTokens: process.env.GEMINI_MAX_TOKENS
+        ? parseInt(process.env.GEMINI_MAX_TOKENS, 10)
+        : 1000,
+      topP: process.env.GEMINI_TOP_P
+        ? parseFloat(process.env.GEMINI_TOP_P)
+        : 0.95,
+      topK: process.env.GEMINI_TOP_K
+        ? parseInt(process.env.GEMINI_TOP_K, 10)
+        : 40,
     },
   };
 });
