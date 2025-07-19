@@ -13,6 +13,7 @@ import { UsersModule } from '../users/users.module';
 import { ChatRepository } from './infrastructure/persistence/chat.repository';
 import { MessageRepository } from './infrastructure/persistence/message.repository';
 import { KnowledgeRepository } from './infrastructure/persistence/knowledge.repository';
+import { ProductRagService } from './services/product-rag.service';
 
 @Module({
   imports: [DocumentChatPersistenceModule, AIModule, UsersModule],
@@ -22,6 +23,7 @@ import { KnowledgeRepository } from './infrastructure/persistence/knowledge.repo
     KagService,
     RagService,
     ShoppingService,
+    ProductRagService,
 
     {
       provide: ChatRepository,

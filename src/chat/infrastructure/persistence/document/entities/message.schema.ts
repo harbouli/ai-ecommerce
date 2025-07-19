@@ -68,7 +68,18 @@ export class MessageSchemaClass extends EntityDocumentHelper {
       {
         source: {
           type: String,
-          enum: ['VECTOR', 'GRAPH', 'DOCUMENT', 'PRODUCT', 'KNOWLEDGE'],
+          enum: [
+            'VECTOR',
+            'GRAPH',
+            'DOCUMENT',
+            'PRODUCT',
+            'KNOWLEDGE',
+            'BRAND',
+            'CATEGORY',
+            'PRICE_COMPARISON',
+            'RECOMMENDATION',
+            'SIMILAR_PRODUCT',
+          ],
           required: true,
         },
         content: { type: String, required: true },
@@ -79,7 +90,17 @@ export class MessageSchemaClass extends EntityDocumentHelper {
     default: [],
   })
   context?: {
-    source: 'VECTOR' | 'GRAPH' | 'DOCUMENT' | 'PRODUCT' | 'KNOWLEDGE';
+    source:
+      | 'VECTOR'
+      | 'GRAPH'
+      | 'DOCUMENT'
+      | 'PRODUCT'
+      | 'KNOWLEDGE'
+      | 'BRAND'
+      | 'CATEGORY'
+      | 'PRICE_COMPARISON'
+      | 'RECOMMENDATION'
+      | 'SIMILAR_PRODUCT';
     content: string;
     score: number;
     metadata: Record<string, any>;

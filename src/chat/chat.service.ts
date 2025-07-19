@@ -12,6 +12,10 @@ import { MessageRepository } from './infrastructure/persistence/message.reposito
 import { AIService, ChatMessage } from '../ai/ai.service';
 import { KagService } from './services/kag.service';
 import { RagService } from './services/rag.service';
+import {
+  ProductRagService,
+  ProductSearchOptions,
+} from './services/product-rag.service'; // Added import
 import { ShoppingService } from './services/shopping.service';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -37,6 +41,7 @@ export class ChatService {
     private readonly aiService: AIService,
     private readonly kagService: KagService,
     private readonly ragService: RagService,
+    private readonly productRagService: ProductRagService,
     private readonly shoppingService: ShoppingService,
   ) {}
 
@@ -403,36 +408,79 @@ export class ChatService {
         entities: analysis.entities,
       });
 
-      // 3. Get RAG context (relevant conversation history)
+      // 3. Check if this is a product-related query and use ProductRagService
+      let productContext: any[] = [];
+      let productSearchResult;
+
+      console.log(
+        '🚀 ~ ChatService ~ this.getSearchStrategy(analysis.intent.intent):',
+        this.getSearchStrategy(analysis.intent.intent),
+      );
+
+      if (this.isShoppingIntent(analysis.intent.intent)) {
+        const productSearchOptions: ProductSearchOptions = {
+          userId: chat.userId,
+          maxContexts: 8,
+          minRelevanceScore: 0.3,
+          searchStrategy: this.getSearchStrategy(analysis.intent.intent),
+          includeRecommendations: true,
+          includeSimilarProducts: true,
+          includeComparisons: true,
+        };
+
+        productSearchResult = await this.productRagService.searchProductContext(
+          userMessage.content,
+          productSearchOptions,
+        );
+
+        productContext = productSearchResult.contexts.map((ctx) => ctx.content);
+        console.log('🚀 ~ ChatService ~ productContext:', productContext);
+
+        // Store the product interaction for future RAG
+        await this.productRagService.storeProductInteraction(
+          userMessage,
+          this.getProductUserAction(analysis.intent.intent),
+        );
+
+        this.logger.log(
+          `Product RAG found ${productSearchResult.contexts.length} relevant contexts for shopping query`,
+        );
+      }
+
+      // 4. Get traditional RAG context for non-product or supplementary context
       const ragContext = await this.ragService.retrieveRelevantContext(
         userMessage.content,
-        5,
+        productContext.length > 0 ? 3 : 5, // Fewer if we have product context
       );
-      console.log('🚀 ~ ChatService ~ ragContext:', ragContext);
 
-      // 4. Get KAG context (knowledge graph relationships)
+      // 5. Get KAG context (knowledge graph relationships)
       const kagContext = await this.kagService.getContextualKnowledge(
         chat.sessionId,
         userMessage.content,
       );
 
-      // 5. Get personalized context
+      // 6. Get personalized context
       const personalizedContext = await this.ragService.getPersonalizedContext(
         chat.userId,
         userMessage.content,
       );
 
-      // 6. Process shopping query if relevant
+      // 7. Process shopping query if relevant (legacy support)
       let shoppingResults;
-      if (this.isShoppingIntent(analysis.intent.intent)) {
+      if (
+        this.isShoppingIntent(analysis.intent.intent) &&
+        productContext.length === 0
+      ) {
+        // Fallback to legacy shopping service if ProductRag didn't find results
         shoppingResults = await this.shoppingService.processShoppingQuery(
           userMessage.content,
           chat.userId,
         );
       }
 
-      // 7. Build comprehensive context
+      // 8. Build comprehensive context array prioritizing product context
       const contextArray = [
+        ...productContext,
         ...ragContext.map((ctx) => ctx.content),
         ...kagContext.map((entity) => `${entity.name}: ${entity.description}`),
         ...personalizedContext.map((ctx) => ctx.content),
@@ -448,7 +496,7 @@ export class ChatService {
         );
       }
 
-      // 8. Get conversation history for AI context
+      // 9. Get conversation history for AI context
       const recentMessages = await this.messageRepository.findByChatId(chat.id);
       const conversationHistory: ChatMessage[] = recentMessages
         .slice(-6) // Last 6 messages for context
@@ -457,24 +505,41 @@ export class ChatService {
           content: msg.content,
         }));
 
-      // 9. Generate AI response
-      const aiResponse = await this.aiService.generateContextualResponse(
-        userMessage.content,
-        contextArray,
-        conversationHistory,
-      );
+      // 10. Generate AI response with enhanced product context
+      let aiResponse;
+      if (productSearchResult && productSearchResult.contexts.length > 0) {
+        // Use product-aware response generation
+        aiResponse = await this.aiService.generateShoppingResponse(
+          userMessage.content,
+          productContext,
+          productSearchResult.userPreferences,
+          conversationHistory,
+        );
+      } else {
+        // Use general contextual response
+        aiResponse = await this.aiService.generateContextualResponse(
+          userMessage.content,
+          contextArray,
+          conversationHistory,
+        );
+      }
 
-      // 10. Create assistant message
+      // 11. Create assistant message with enhanced context
       const assistantMessage = await this.createAssistantMessage(
         chat,
         aiResponse,
-        ragContext,
+        [...ragContext, ...(productSearchResult?.contexts || [])],
         analysis,
         processingStartTime,
+        productSearchResult,
       );
 
-      // 11. Update knowledge graph and conversation context (async)
-      void this.updateContextAsync(userMessage, assistantMessage);
+      // 12. Update context async (including product interactions)
+      void this.updateContextAsync(
+        userMessage,
+        assistantMessage,
+        productSearchResult,
+      );
 
       return assistantMessage;
     } catch (error) {
@@ -494,6 +559,7 @@ export class ChatService {
     ragContext: MessageContext[],
     analysis: any,
     processingStartTime: number,
+    productSearchResult?: any,
   ): Promise<Message> {
     const processingTime = Date.now() - processingStartTime;
 
@@ -514,6 +580,17 @@ export class ChatService {
         processingTime,
         temperature: 0.7,
         aiProcessingTime: aiResponse.processingTime,
+        // Product-specific metadata
+        productSearchResult: productSearchResult
+          ? {
+              totalFound: productSearchResult.totalFound,
+              searchType: productSearchResult.productInsights.searchType,
+              commercialIntent:
+                productSearchResult.productInsights.commercialIntent,
+              detectedProducts:
+                productSearchResult.productInsights.detectedProducts,
+            }
+          : undefined,
       } as MessageMetadata,
       intent: 'RESPONSE',
       confidence: aiResponse.confidence || 0.8,
@@ -600,6 +677,7 @@ export class ChatService {
   private async updateContextAsync(
     userMessage: Message,
     assistantMessage: Message,
+    productSearchResult?: any,
   ): Promise<void> {
     try {
       // Update knowledge graph
@@ -608,6 +686,14 @@ export class ChatService {
       // Store conversation context for RAG
       await this.ragService.storeConversationContext(userMessage);
       await this.ragService.storeConversationContext(assistantMessage);
+
+      // Store product interaction if we have product results
+      if (productSearchResult && productSearchResult.contexts.length > 0) {
+        await this.productRagService.storeProductInteraction(
+          assistantMessage,
+          'recommended',
+        );
+      }
     } catch (error) {
       this.logger.warn('Failed to update context asynchronously:', error);
     }
@@ -627,6 +713,7 @@ export class ChatService {
   private isShoppingIntent(intent: string): boolean {
     const shoppingIntents = [
       'PRODUCT_SEARCH',
+      'AVAILABILITY',
       'PRODUCT_INQUIRY',
       'RECOMMENDATION',
       'COMPARISON',
@@ -635,6 +722,37 @@ export class ChatService {
       'BROWSE_BRAND',
     ];
     return shoppingIntents.includes(intent);
+  }
+
+  private getSearchStrategy(
+    intent: string,
+  ): 'comprehensive' | 'focused' | 'recommendations' | 'comparisons' {
+    switch (intent) {
+      case 'RECOMMENDATION':
+        return 'recommendations';
+      case 'COMPARISON':
+        return 'comparisons';
+      case 'PRODUCT_SEARCH':
+      case 'PRODUCT_INQUIRY':
+        return 'focused';
+      default:
+        return 'comprehensive';
+    }
+  }
+
+  private getProductUserAction(
+    intent: string,
+  ): 'viewed' | 'searched' | 'purchased' | 'compared' | 'recommended' {
+    switch (intent) {
+      case 'COMPARISON':
+        return 'compared';
+      case 'RECOMMENDATION':
+        return 'recommended';
+      case 'PRICE_CHECK':
+        return 'viewed';
+      default:
+        return 'searched';
+    }
   }
 
   private generateSessionId(): string {

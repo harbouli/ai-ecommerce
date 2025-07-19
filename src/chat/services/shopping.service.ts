@@ -215,71 +215,77 @@ export class ShoppingService {
     suggestions: string[];
   }> {
     try {
-      this.logger.log(`Processing shopping query: ${query}`);
-
-      // Extract intent and entities from query (simplified)
-      const intent = this.extractIntent(query);
-      const entities = this.extractEntities(query);
+      this.logger.log(`Processing watch query: ${query}`);
 
       let products: KnowledgeEntity[] = [];
       let recommendations: ShoppingRecommendation[] = [];
       const suggestions: string[] = [];
 
-      switch (intent) {
-        case 'SEARCH':
-          products = await this.semanticProductSearch(query, { limit: 10 });
-          if (products.length > 0) {
-            recommendations = await this.getProductRecommendations(
-              products[0].id,
-              3,
-            );
-          }
-          break;
-
-        case 'BROWSE_CATEGORY':
-          const category = entities.find((e) => e.type === 'CATEGORY')?.value;
-          if (category) {
-            products = await this.getProductsByCategory(category);
-          }
-          break;
-
-        case 'BROWSE_BRAND':
-          const brand = entities.find((e) => e.type === 'BRAND')?.value;
-          if (brand) {
-            products = await this.getProductsByBrand(brand);
-          }
-          break;
-
-        case 'RECOMMENDATION':
-          if (userId) {
-            const userPreferences = entities.map((e) => e.value);
-            recommendations = await this.getPersonalizedRecommendations(
-              userId,
-              userPreferences,
-              10,
-            );
-          }
-          break;
-
-        default:
-          // Fallback to semantic search
-          products = await this.semanticProductSearch(query, { limit: 5 });
+      // Simple search logic
+      if (query.toLowerCase().includes('smartwatch')) {
+        products = await this.semanticProductSearch(query, {
+          category: 'smartwatch',
+          limit: 8,
+        });
+        suggestions.push(
+          'Compare battery life',
+          'Check phone compatibility',
+          'See fitness features',
+        );
+      } else if (
+        query.toLowerCase().includes('luxury') ||
+        query.toLowerCase().includes('rolex')
+      ) {
+        products = await this.semanticProductSearch(query, {
+          category: 'luxury',
+          limit: 8,
+        });
+        suggestions.push(
+          'View similar luxury watches',
+          'Check availability',
+          'Learn about the brand',
+        );
+      } else if (
+        query.toLowerCase().includes('band') ||
+        query.toLowerCase().includes('strap')
+      ) {
+        products = await this.getProductsByCategory('watch-bands');
+        suggestions.push(
+          'Check watch compatibility',
+          'See different materials',
+          'View size options',
+        );
+      } else {
+        // General watch search
+        products = await this.semanticProductSearch(query, { limit: 10 });
+        suggestions.push(
+          'Filter by price',
+          'See similar styles',
+          'Check our bestsellers',
+        );
       }
 
-      // Generate contextual suggestions
-      if (products.length > 0) {
-        suggestions.push(
-          `Show similar products to "${products[0].name}"`,
-          `Filter by category`,
-          `Sort by price`,
-          'Show customer reviews',
+      // Get simple recommendations
+      if (products.length > 0 && userId) {
+        recommendations = await this.getPersonalizedRecommendations(
+          userId,
+          [query],
+          3,
         );
       }
 
       return { products, recommendations, suggestions };
     } catch (error) {
-      this.logger.error('Failed to process shopping query:', error);
-      return { products: [], recommendations: [], suggestions: [] };
+      this.logger.error('Failed to process watch query:', error);
+      return {
+        products: [],
+        recommendations: [],
+        suggestions: [
+          'Browse smartwatches',
+          'See luxury collection',
+          'Check watch bands',
+        ],
+      };
     }
   }
 

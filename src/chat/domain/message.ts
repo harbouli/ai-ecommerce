@@ -18,6 +18,7 @@ export class Message {
 export class MessageMetadata {
   processingTime?: number;
   tokensUsed?: number;
+  userAction?: string;
   model?: string;
   temperature?: number;
   userId?: string;
@@ -26,7 +27,17 @@ export class MessageMetadata {
 }
 
 export class MessageContext {
-  source: 'VECTOR' | 'GRAPH' | 'DOCUMENT' | 'PRODUCT' | 'KNOWLEDGE';
+  source:
+    | 'VECTOR'
+    | 'GRAPH'
+    | 'DOCUMENT'
+    | 'PRODUCT'
+    | 'KNOWLEDGE'
+    | 'BRAND'
+    | 'CATEGORY'
+    | 'PRICE_COMPARISON'
+    | 'RECOMMENDATION'
+    | 'SIMILAR_PRODUCT';
   content: string;
   score: number;
   metadata: Record<string, any>;

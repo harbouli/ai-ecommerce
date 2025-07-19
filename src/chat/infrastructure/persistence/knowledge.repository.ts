@@ -1,4 +1,3 @@
-// src/chat/infrastructure/persistence/knowledge.repository.ts
 import { NullableType } from '../../../utils/types/nullable.type';
 import { KnowledgeEntity } from '../../domain/knowledge';
 

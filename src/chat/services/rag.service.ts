@@ -1,4 +1,3 @@
-// src/chat/services/rag.service.ts
 import { Injectable, Logger } from '@nestjs/common';
 import { MessageRepository } from '../infrastructure/persistence/message.repository';
 import { Message, MessageContext, MessageMetadata } from '../domain/message';

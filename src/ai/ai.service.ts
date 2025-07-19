@@ -429,16 +429,18 @@ export class AIService {
     const requestStartTime = startTime || Date.now();
 
     try {
-      // Check if Ollama is available
+      this.logger.log(
+        `Starting Ollama generation for prompt: "${prompt.substring(0, 100)}..."`,
+      );
+
       await this.checkOllamaHealth();
 
-      // Build conversation context for Llama
       const fullPrompt = this.buildOllamaPrompt(prompt, conversationHistory);
 
       const ollamaRequest: OllamaGenerateRequest = {
         model: customOptions?.model || this.ollamaChatModel,
         prompt: fullPrompt,
-        stream: false, // IMPORTANT: Disable streaming to get complete response
+        stream: false,
         options: {
           temperature: customOptions?.temperature || this.temperature,
           top_p: customOptions?.topP || this.topP,
@@ -447,37 +449,33 @@ export class AIService {
         },
       };
 
+      this.logger.log(
+        `Sending request to Ollama with model: ${ollamaRequest.model}`,
+      );
+
       const response = await this.ollamaClient.post<OllamaGenerateResponse>(
         '/api/generate',
         ollamaRequest,
-        { timeout: 30000 }, // 30 second timeout
+        { timeout: 30000 },
       );
 
       const ollamaResponse = response.data;
-
       const processingTime = Date.now() - requestStartTime;
       const tokensUsed =
         (ollamaResponse.eval_count || 0) +
         (ollamaResponse.prompt_eval_count || 0);
 
-      // Enhanced content validation with detailed logging
-      const content = ollamaResponse.response?.trim() || '';
+      // FIX: Use improved validation method
+      const content = this.validateOllamaResponse(ollamaResponse);
 
-      if (content.length > 0) {
-      } else {
-        this.logger.warn('Response content is empty or undefined');
-        this.logger.warn(`Raw response field: "${ollamaResponse.response}"`);
-      }
-
-      if (!content || content.length === 0) {
-        this.logger.warn('Ollama returned empty or null response');
+      if (!content) {
+        this.logger.warn('Ollama response validation failed, using fallback');
         return this.getFallbackResponse(prompt, requestStartTime);
       }
 
-      // Check for common Ollama error responses
-      if (this.isOllamaErrorResponse(content)) {
-        return this.getFallbackResponse(prompt, requestStartTime);
-      }
+      this.logger.log(
+        `Ollama generation completed successfully in ${processingTime}ms`,
+      );
 
       return {
         content,
@@ -488,15 +486,7 @@ export class AIService {
         fromCache: false,
       };
     } catch (error) {
-      this.logger.error('Ollama generation failed with error:', error);
-      this.logger.error('Error details:', {
-        message: error.message,
-        code: error.code,
-        response: error.response?.data,
-        stack: error.stack?.split('\n').slice(0, 5).join('\n'),
-      });
-
-      // Return intelligent fallback instead of throwing
+      this.logger.error('Ollama generation failed:', error.message);
       this.logger.warn('Using intelligent fallback due to Ollama failure');
       return this.getFallbackResponse(prompt, requestStartTime);
     }
@@ -808,54 +798,81 @@ export class AIService {
   async classifyIntent(
     text: string,
     customIntents?: string[],
-    provider?: 'gemini' | 'ollama' | 'auto',
   ): Promise<IntentClassification> {
+    const startTime = Date.now();
+
     try {
-      const shortPrompt = `Intent for "${text.substring(0, 100)}"? Options: ${this.getDefaultIntents().slice(0, 7).join(', ')}. Answer with one word.`;
+      const intents = customIntents || this.getDefaultIntents();
 
-      const response = await this.generateResponse(shortPrompt, undefined, {
-        maxTokens: 20,
-        useCache: true,
-        provider: provider || this.preferredProvider,
-      });
+      // FIX: Use simpler prompt that doesn't require JSON parsing for Ollama
+      const prompt = `
+    Classify the intent of this message into one of these categories: ${intents.join(', ')}
+    
+    Message: "${text}"
+    
+    Reply with just the intent name, followed by a confidence score (0-1), then a brief reason.
+    Format: INTENT_NAME|0.95|reason here
+    `;
 
-      // FIX: Check if response.content exists and is not empty
-      if (!response.content || typeof response.content !== 'string') {
-        this.logger.warn('Empty or invalid response content in classifyIntent');
-        return {
-          intent: 'OTHER',
-          confidence: 0.3,
-          entities: [],
-          metadata: {
-            error: 'Empty response content',
-            originalText: text,
-          },
-        };
+      const response = await this.generateResponse(prompt);
+
+      // FIX: Parse simple format instead of JSON
+      try {
+        const lines = response.content.trim().split('\n');
+        const firstLine = lines[0].trim();
+
+        if (firstLine.includes('|')) {
+          const [intentPart, confidencePart, ...reasonParts] =
+            firstLine.split('|');
+          const intent = intentPart.trim().toUpperCase();
+          const confidence = parseFloat(confidencePart.trim()) || 0.8;
+          const reasoning = reasonParts.join('|').trim() || 'AI classification';
+
+          const processingTime = Date.now() - startTime;
+
+          this.logger.log(
+            `Intent classified as '${intent}' with confidence ${confidence} in ${processingTime}ms`,
+          );
+
+          return {
+            intent: intents.includes(intent) ? intent : 'OTHER',
+            confidence,
+            entities: [],
+            metadata: {
+              reasoning,
+              processingTime,
+              originalText: text,
+            },
+          };
+        } else {
+          // Fallback: try to find intent in the response
+          const foundIntent = intents.find((intent) =>
+            response.content.toUpperCase().includes(intent),
+          );
+
+          return {
+            intent: foundIntent || 'OTHER',
+            confidence: 0.6,
+            entities: [],
+            metadata: {
+              reasoning: 'Fallback pattern matching',
+              processingTime: Date.now() - startTime,
+              originalText: text,
+              rawResponse: response.content,
+            },
+          };
+        }
+      } catch (parseError) {
+        this.logger.warn(
+          'Failed to parse enhanced intent response, using simple classification',
+        );
+
+        // FIX: Fallback to simple pattern matching
+        return this.classifyIntentSimple(text, customIntents);
       }
-
-      const intent = response.content.trim().toUpperCase();
-      const validIntents = this.getDefaultIntents();
-      const finalIntent = validIntents.includes(intent) ? intent : 'OTHER';
-
-      return {
-        intent: finalIntent,
-        confidence: response.fromCache ? 0.9 : 0.8,
-        entities: [],
-        metadata: {
-          processingTime: response.processingTime,
-          originalText: text,
-          fromCache: response.fromCache,
-          provider: response.provider,
-        },
-      };
     } catch (error) {
-      this.logger.error('Error classifying intent:', error);
-      return {
-        intent: 'OTHER',
-        confidence: 0.3,
-        entities: [],
-        metadata: { error: error.message, originalText: text },
-      };
+      this.logger.error('Error in enhanced intent classification:', error);
+      return this.classifyIntentSimple(text, customIntents);
     }
   }
 
@@ -1106,24 +1123,51 @@ export class AIService {
     provider?: 'gemini' | 'ollama' | 'auto',
   ): Promise<string[]> {
     try {
-      const shortPrompt = `3 short questions about: "${context.substring(0, 100)}"`;
+      // Check if it's watch-related for specialized suggestions
+      const isWatchQuery = this.isWatchRelated(context);
+
+      if (isWatchQuery) {
+        // Use simple watch-focused prompt
+        const watchPrompt = `Customer is asking about watches: "${context}". 
+    Provide ${numberOfSuggestions} helpful watch-related suggestions. Each on a new line with a number.`;
+
+        const response = await this.generateResponse(watchPrompt, undefined, {
+          maxTokens: 150,
+          useCache: true,
+          provider: provider || this.preferredProvider,
+        });
+
+        if (response.content) {
+          const suggestions = response.content
+            .split('\n')
+            .filter((line) => line.trim().length > 0)
+            .map((line) => line.replace(/^\d+\.?\s*/, '').trim())
+            .filter((suggestion) => suggestion.length > 0)
+            .slice(0, numberOfSuggestions);
+
+          if (suggestions.length > 0) {
+            return suggestions;
+          }
+        }
+
+        // Fallback to simple watch suggestions
+        return this.getSimpleWatchSuggestions(context);
+      }
+
+      // For general queries, use shorter prompt to save tokens
+      const shortPrompt = `Based on: "${context.substring(0, 200)}", provide ${numberOfSuggestions} helpful suggestions. Format as numbered list.`;
 
       const response = await this.generateResponse(shortPrompt, undefined, {
-        maxTokens: 80,
+        maxTokens: 150,
         useCache: true,
         provider: provider || this.preferredProvider,
       });
 
-      // FIX: Check if response.content exists and is not empty
       if (!response.content || typeof response.content !== 'string') {
         this.logger.warn(
           'Empty or invalid response content in generateSuggestions',
         );
-        return [
-          'How can I help you further?',
-          'Would you like product recommendations?',
-          'Do you have other questions?',
-        ];
+        return this.getDefaultSuggestions(context);
       }
 
       const suggestions = response.content
@@ -1133,21 +1177,200 @@ export class AIService {
         .filter((suggestion) => suggestion.length > 0)
         .slice(0, numberOfSuggestions);
 
-      return suggestions.length > 0
-        ? suggestions
-        : [
-            'Can you tell me more?',
-            'Would you like recommendations?',
-            'Do you need help with anything else?',
-          ];
+      if (suggestions.length === 0) {
+        this.logger.warn('No valid suggestions parsed, using defaults');
+        return this.getDefaultSuggestions(context);
+      }
+
+      this.logger.log(
+        `Generated ${suggestions.length} suggestions successfully`,
+      );
+      return suggestions;
     } catch (error) {
       this.logger.error('Error generating suggestions:', error);
+      return this.getDefaultSuggestions(context);
+    }
+  }
+
+  private isWatchRelated(context: string): boolean {
+    const watchWords = [
+      'watch',
+      'smartwatch',
+      'timepiece',
+      'rolex',
+      'apple watch',
+      'band',
+      'strap',
+    ];
+    return watchWords.some((word) => context.toLowerCase().includes(word));
+  }
+  private getSimpleWatchSuggestions(context: string): string[] {
+    const lowerContext = context.toLowerCase();
+
+    if (lowerContext.includes('smartwatch') || lowerContext.includes('apple')) {
+      return [
+        'What features do you need in a smartwatch?',
+        'Are you looking for fitness tracking or notifications?',
+        "What's your phone - iPhone or Android?",
+      ];
+    }
+
+    if (lowerContext.includes('luxury') || lowerContext.includes('rolex')) {
+      return [
+        'What occasions will you wear this watch?',
+        'Do you prefer gold or steel?',
+        'Are you interested in automatic or quartz?',
+      ];
+    }
+
+    if (lowerContext.includes('gift')) {
+      return [
+        "What's your budget for the watch gift?",
+        'Is this for a man or woman?',
+        'Do they prefer smart or traditional watches?',
+      ];
+    }
+
+    if (lowerContext.includes('band') || lowerContext.includes('strap')) {
+      return [
+        'What watch do you need a band for?',
+        'Do you prefer leather or metal bands?',
+        'What color are you looking for?',
+      ];
+    }
+
+    if (lowerContext.includes('price') || lowerContext.includes('budget')) {
+      return [
+        "What's your budget range?",
+        'Would you like to see our current deals?',
+        'Are you interested in payment plans?',
+      ];
+    }
+
+    // Default watch suggestions
+    return [
+      'Are you looking for a smartwatch or traditional watch?',
+      "What's your budget range?",
+      'Would you like to see our bestsellers?',
+    ];
+  }
+
+  private getDefaultSuggestions(context: string): string[] {
+    const lowerContext = context.toLowerCase();
+
+    if (lowerContext.includes('product') || lowerContext.includes('buy')) {
+      return [
+        'What specific features are you looking for?',
+        'Do you have a preferred price range?',
+        'Would you like to see our current deals?',
+      ];
+    } else if (
+      lowerContext.includes('price') ||
+      lowerContext.includes('cost')
+    ) {
+      return [
+        'Check our current promotions and discounts',
+        'Compare prices with similar products',
+        'Sign up for price alerts on this item',
+      ];
+    } else if (
+      lowerContext.includes('recommend') ||
+      lowerContext.includes('suggest')
+    ) {
+      return [
+        'Tell me about your preferences',
+        'What will you use this for?',
+        'Do you have a favorite brand?',
+      ];
+    } else if (
+      lowerContext.includes('compare') ||
+      lowerContext.includes('vs')
+    ) {
+      return [
+        'What factors are most important to you?',
+        'Would you like to see detailed specifications?',
+        'Should I add more products to compare?',
+      ];
+    } else {
       return [
         'How can I help you further?',
         'Would you like product recommendations?',
         'Do you have other questions?',
       ];
     }
+  }
+
+  /**
+   * Determines whether suggestions should be generated based on intent and confidence
+   */
+  private shouldGenerateSuggestions(
+    intent: string,
+    confidence: number,
+  ): boolean {
+    // Don't generate suggestions for low confidence classifications
+    if (confidence < 0.6) {
+      this.logger.log(`Low confidence (${confidence}) - skipping suggestions`);
+      return false;
+    }
+
+    // Define intents that DON'T need suggestions
+    const intentsThatDontNeedSuggestions = new Set([
+      'GREETING', // Simple greeting, no suggestions needed
+      'THANK_YOU', // User saying thanks, no suggestions needed
+      'GOODBYE', // User ending conversation, no suggestions needed
+      'CONFIRMATION', // User confirming something, no suggestions needed
+      'ORDER_STATUS', // User checking order, specific info request
+      'SIMPLE_QUESTION', // Direct question with clear answer
+      'COMPLETED_PURCHASE', // User completed purchase, no more suggestions needed
+    ]);
+
+    // Define intents that DO need suggestions
+    const intentsThatNeedSuggestions = new Set([
+      'PRODUCT_SEARCH', // User is searching, might need refinement suggestions
+      'RECOMMENDATION', // User wants recommendations, offer alternatives
+      'PRICE_INQUIRY', // User asking about price, suggest related products/deals
+      'COMPARISON', // User comparing products, suggest other comparisons
+      'AVAILABILITY', // User checking availability, suggest alternatives
+      'SUPPORT', // User needs help, offer specific help options
+      'OTHER', // Unknown intent, might need guidance
+    ]);
+
+    // Check if intent explicitly doesn't need suggestions
+    if (intentsThatDontNeedSuggestions.has(intent)) {
+      this.logger.log(`Intent '${intent}' doesn't require suggestions`);
+      return false;
+    }
+
+    // Check if intent explicitly needs suggestions
+    if (intentsThatNeedSuggestions.has(intent)) {
+      this.logger.log(`Intent '${intent}' requires suggestions`);
+      return true;
+    }
+
+    // For high confidence unknown intents, use additional heuristics
+    if (confidence > 0.8 && intent.includes('SEARCH')) {
+      this.logger.log(
+        `High confidence search-related intent - generating suggestions`,
+      );
+      return true;
+    }
+
+    // Medium confidence intents related to products need suggestions
+    if (
+      confidence > 0.7 &&
+      (intent.includes('PRODUCT') || intent.includes('BUY'))
+    ) {
+      this.logger.log(
+        `Product-related intent with good confidence - generating suggestions`,
+      );
+      return true;
+    }
+
+    // Default to no suggestions for unknown intents
+    this.logger.log(
+      `Intent '${intent}' with confidence ${confidence} doesn't match suggestion criteria`,
+    );
+    return false;
   }
 
   async analyzeQuery(
@@ -1162,32 +1385,50 @@ export class AIService {
     const startTime = Date.now();
 
     try {
+      this.logger.log(`Analyzing query: ${query.substring(0, 100)}...`);
+
       // Execute in sequence with delays to respect rate limits (only for Gemini)
       const selectedProvider = provider || this.preferredProvider;
-      const intent = await this.classifyIntent(
-        query,
-        undefined,
-        selectedProvider,
-      );
+
+      // Step 1: Classify intent
+      const intent = await this.classifyIntent(query, undefined);
 
       // Small delay between requests only for Gemini
       if (selectedProvider === 'gemini') {
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
 
+      // Step 2: Extract entities
       const entities = await this.extractEntities(query);
 
-      if (selectedProvider === 'gemini') {
-        await new Promise((resolve) => setTimeout(resolve, 100));
+      // Step 3: Generate suggestions ONLY when needed based on intent
+      let suggestions: string[] = [];
+
+      if (this.shouldGenerateSuggestions(intent.intent, intent.confidence)) {
+        if (selectedProvider === 'gemini') {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+
+        suggestions = await this.generateSuggestions(
+          query,
+          3,
+          selectedProvider,
+        );
+
+        this.logger.log(
+          `Generated ${suggestions.length} suggestions for intent: ${intent.intent}`,
+        );
+      } else {
+        this.logger.log(
+          `Skipped suggestion generation for intent: ${intent.intent} (confidence: ${intent.confidence})`,
+        );
       }
 
-      const suggestions = await this.generateSuggestions(
-        query,
-        3,
-        selectedProvider,
-      );
-
       const processingTime = Date.now() - startTime;
+
+      this.logger.log(
+        `Query analyzed in ${processingTime}ms using ${selectedProvider}`,
+      );
 
       return {
         intent,
@@ -1206,7 +1447,7 @@ export class AIService {
           metadata: { error: error.message },
         },
         entities: [],
-        suggestions: ['How can I help you?'],
+        suggestions: ['How can I help you?'], // Fallback suggestion only for errors
         processingTime: Date.now() - startTime,
       };
     }
@@ -1346,10 +1587,6 @@ Guidelines:
     ];
   }
 
-  private getDefaultEntityTypes(): string[] {
-    return ['PRODUCT', 'CATEGORY', 'BRAND', 'PRICE', 'FEATURE', 'LOCATION'];
-  }
-
   private estimateTokenCount(text: string): number {
     return Math.ceil(text.length / 4);
   }
@@ -1471,7 +1708,58 @@ Guidelines:
     ];
     return searchPatterns.some((pattern) => text.includes(pattern));
   }
+  // FIX: Add simple intent classification as fallback
+  private classifyIntentSimple(
+    text: string,
+    customIntents?: string[],
+  ): IntentClassification {
+    const lowerText = text.toLowerCase();
+    let intent = 'OTHER';
+    let confidence = 0.5;
 
+    if (
+      lowerText.includes('price') ||
+      lowerText.includes('cost') ||
+      lowerText.includes('how much')
+    ) {
+      intent = 'PRICE_INQUIRY';
+      confidence = 0.8;
+    } else if (
+      lowerText.includes('search') ||
+      lowerText.includes('find') ||
+      lowerText.includes('looking for')
+    ) {
+      intent = 'PRODUCT_SEARCH';
+      confidence = 0.8;
+    } else if (
+      lowerText.includes('recommend') ||
+      lowerText.includes('suggest')
+    ) {
+      intent = 'RECOMMENDATION';
+      confidence = 0.8;
+    } else if (
+      lowerText.includes('hello') ||
+      lowerText.includes('hi') ||
+      lowerText.includes('hey')
+    ) {
+      intent = 'GREETING';
+      confidence = 0.9;
+    } else if (lowerText.includes('help') || lowerText.includes('support')) {
+      intent = 'HELP_REQUEST';
+      confidence = 0.8;
+    }
+
+    return {
+      intent,
+      confidence,
+      entities: [],
+      metadata: {
+        reasoning: 'Simple pattern matching fallback',
+        processingTime: 0,
+        originalText: text,
+      },
+    };
+  }
   private isPriceInquiry(text: string): boolean {
     const pricePatterns = [
       'price',
@@ -1542,21 +1830,72 @@ Guidelines:
     ];
     return conversationPatterns.some((pattern) => text.includes(pattern));
   }
+
   private isOllamaErrorResponse(content: string): boolean {
-    const errorPatterns = [
-      'error',
-      'failed',
-      'unable',
-      'cannot',
-      'connection',
-      'timeout',
-      'not found',
-      '404',
-      '500',
-      'internal server error',
-      'bad request',
-    ];
+    // FIX: More precise error detection - don't treat long valid responses as errors
+    if (!content || content.length === 0) {
+      return true;
+    }
+
     const lowerContent = content.toLowerCase();
-    return errorPatterns.some((pattern) => lowerContent.includes(pattern));
+
+    // FIX: Only treat as error if it's clearly an error message, not a long response
+    if (content.length < 50) {
+      // Short responses are more likely to be errors
+      const errorPatterns = [
+        'error',
+        'failed',
+        'unable to',
+        'cannot',
+        'connection',
+        'timeout',
+        'not found',
+        '404',
+        '500',
+        'internal server error',
+        'bad request',
+        'model not found',
+      ];
+
+      return errorPatterns.some((pattern) => lowerContent.includes(pattern));
+    }
+
+    // FIX: For longer responses, only check for specific error indicators
+    const criticalErrorPatterns = [
+      'model not found',
+      'connection refused',
+      'server error',
+      'timeout error',
+    ];
+
+    return criticalErrorPatterns.some((pattern) =>
+      lowerContent.includes(pattern),
+    );
+  }
+
+  private validateOllamaResponse(
+    ollamaResponse: OllamaGenerateResponse,
+  ): string | null {
+    // Check if response is complete
+    if (!ollamaResponse.done) {
+      this.logger.warn('Ollama response is not complete');
+      return null;
+    }
+
+    // Get and validate content
+    const content = ollamaResponse.response?.trim() || '';
+
+    if (!content || content.length === 0) {
+      this.logger.warn('Ollama returned empty content');
+      return null;
+    }
+
+    // FIX: Don't treat long responses as errors automatically
+    if (this.isOllamaErrorResponse(content)) {
+      this.logger.warn(`Ollama returned error response: "${content}"`);
+      return null;
+    }
+
+    return content;
   }
 }
