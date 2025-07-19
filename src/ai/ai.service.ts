@@ -322,13 +322,6 @@ export class AIService {
       this.configService.get('app.gemini.topP', { infer: true }) || 0.95;
     this.topK =
       this.configService.get('app.gemini.topK', { infer: true }) || 40;
-
-    this.logger.log(
-      `AI Service initialized with preferred provider: ${this.preferredProvider}`,
-    );
-    this.logger.log(
-      `Ollama models: Chat=${this.ollamaChatModel}, Embedding=${this.ollamaEmbeddingModel}`,
-    );
   }
 
   async generateResponse(
@@ -357,7 +350,6 @@ export class AIService {
         );
         const cachedResponse = this.cache.get(cacheKey);
         if (cachedResponse) {
-          this.logger.log(`Returning cached response from ${provider}`);
           return {
             ...cachedResponse,
             fromCache: true,
@@ -437,17 +429,11 @@ export class AIService {
     const requestStartTime = startTime || Date.now();
 
     try {
-      this.logger.log(
-        `Starting Ollama generation for prompt: "${prompt.substring(0, 100)}..."`,
-      );
-
       // Check if Ollama is available
       await this.checkOllamaHealth();
 
       // Build conversation context for Llama
       const fullPrompt = this.buildOllamaPrompt(prompt, conversationHistory);
-
-      this.logger.log(`Full prompt length: ${fullPrompt.length} characters`);
 
       const ollamaRequest: OllamaGenerateRequest = {
         model: customOptions?.model || this.ollamaChatModel,
@@ -461,13 +447,6 @@ export class AIService {
         },
       };
 
-      this.logger.log(
-        `Sending NON-STREAMING request to Ollama with model: ${ollamaRequest.model}`,
-      );
-      this.logger.log(
-        `Request options: ${JSON.stringify(ollamaRequest.options, null, 2)}`,
-      );
-
       const response = await this.ollamaClient.post<OllamaGenerateResponse>(
         '/api/generate',
         ollamaRequest,
@@ -476,29 +455,15 @@ export class AIService {
 
       const ollamaResponse = response.data;
 
-      this.logger.log(
-        `Ollama response received. Status: ${ollamaResponse.done ? 'completed' : 'incomplete'}`,
-      );
-      this.logger.log(
-        `Raw response object:`,
-        JSON.stringify(ollamaResponse, null, 2),
-      );
-
       const processingTime = Date.now() - requestStartTime;
       const tokensUsed =
         (ollamaResponse.eval_count || 0) +
         (ollamaResponse.prompt_eval_count || 0);
 
-      this.logger.log(
-        `Ollama metrics - Processing time: ${processingTime}ms, Tokens used: ${tokensUsed}`,
-      );
-
       // Enhanced content validation with detailed logging
       const content = ollamaResponse.response?.trim() || '';
 
-      this.logger.log(`Response content length: ${content.length}`);
       if (content.length > 0) {
-        this.logger.log(`Response preview: "${content.substring(0, 200)}..."`);
       } else {
         this.logger.warn('Response content is empty or undefined');
         this.logger.warn(`Raw response field: "${ollamaResponse.response}"`);
@@ -511,11 +476,8 @@ export class AIService {
 
       // Check for common Ollama error responses
       if (this.isOllamaErrorResponse(content)) {
-        this.logger.warn(`Ollama returned error response: "${content}"`);
         return this.getFallbackResponse(prompt, requestStartTime);
       }
-
-      this.logger.log('Ollama generation completed successfully');
 
       return {
         content,
@@ -595,10 +557,6 @@ export class AIService {
       optimizedPrompt = `${recentHistory}\nUser: ${optimizedPrompt}`;
     }
 
-    this.logger.log(
-      `Generating Gemini response for prompt: ${prompt.substring(0, 100)}...`,
-    );
-
     const result = await generativeModel.generateContent(optimizedPrompt);
     const response = await result.response;
     const content = response.text();
@@ -608,10 +566,6 @@ export class AIService {
 
     // Record the request
     this.rateLimitManager.recordRequest(tokensUsed);
-
-    this.logger.log(
-      `Gemini response generated in ${processingTime}ms using ${tokensUsed} tokens`,
-    );
 
     return {
       content,
@@ -641,7 +595,6 @@ export class AIService {
       );
       const cachedEmbedding = this.cache.get(cacheKey);
       if (cachedEmbedding) {
-        this.logger.log(`Returning cached embedding from ${provider}`);
         return cachedEmbedding;
       }
 
@@ -708,8 +661,6 @@ export class AIService {
         prompt: truncatedText,
       };
 
-      this.logger.log(`Generating Ollama embedding with model: ${model}`);
-
       const response = await this.ollamaClient.post<OllamaEmbedResponse>(
         '/api/embeddings',
         request,
@@ -721,10 +672,6 @@ export class AIService {
       }
 
       const processingTime = Date.now() - startTime;
-
-      this.logger.log(
-        `Ollama embedding generated in ${processingTime}ms with ${ollamaResponse.embedding.length} dimensions`,
-      );
 
       return {
         vector: ollamaResponse.embedding,
@@ -778,10 +725,6 @@ export class AIService {
       const processingTime = Date.now() - startTime;
       this.rateLimitManager.recordRequest(estimatedTokens);
 
-      this.logger.log(
-        `Gemini embedding generated in ${processingTime}ms with ${embedding.values.length} dimensions`,
-      );
-
       return {
         vector: embedding.values,
         dimensions: embedding.values.length,
@@ -830,9 +773,7 @@ export class AIService {
 
   async pullOllamaModel(modelName: string): Promise<void> {
     try {
-      this.logger.log(`Pulling Ollama model: ${modelName}`);
       await this.ollamaClient.post('/api/pull', { name: modelName });
-      this.logger.log(`Successfully pulled model: ${modelName}`);
     } catch (error) {
       this.logger.error(`Failed to pull model ${modelName}:`, error);
       throw new Error(`Failed to pull model ${modelName}: ${error.message}`);
@@ -1221,8 +1162,6 @@ export class AIService {
     const startTime = Date.now();
 
     try {
-      this.logger.log(`Analyzing query: ${query.substring(0, 100)}...`);
-
       // Execute in sequence with delays to respect rate limits (only for Gemini)
       const selectedProvider = provider || this.preferredProvider;
       const intent = await this.classifyIntent(
@@ -1249,10 +1188,6 @@ export class AIService {
       );
 
       const processingTime = Date.now() - startTime;
-
-      this.logger.log(
-        `Query analyzed in ${processingTime}ms using ${selectedProvider}`,
-      );
 
       return {
         intent,
@@ -1332,7 +1267,6 @@ Response:`;
 
   clearCache() {
     this.cache.clear();
-    this.logger.log('Cache cleared');
   }
 
   // Enhanced provider switching
@@ -1359,7 +1293,6 @@ Response:`;
         }
       }
 
-      this.logger.log(`Successfully switched to provider: ${newProvider}`);
       return true;
     } catch (error) {
       this.logger.error(`Failed to switch to provider ${newProvider}:`, error);
