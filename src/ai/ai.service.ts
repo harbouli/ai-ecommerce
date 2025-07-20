@@ -1,1901 +1,797 @@
 /* eslint-disable @typescript-eslint/no-unused-vars */
-import { Injectable, Logger } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import { GoogleGenerativeAI, GenerativeModel } from '@google/generative-ai';
-import axios, { AxiosInstance } from 'axios';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { HttpService } from '@nestjs/axios';
+import { firstValueFrom } from 'rxjs';
 import { AllConfigType } from '../config/config.type';
+import { ConfigService } from '@nestjs/config';
 
-export interface ChatMessage {
-  role: 'user' | 'assistant' | 'system';
-  content: string;
-}
-
-export interface AIResponse {
-  content: string;
-  tokensUsed: number;
-  processingTime: number;
-  model: string;
-  provider: 'gemini' | 'ollama';
-  confidence?: number;
-  fromCache?: boolean;
-}
-
-export interface ExtractedEntity {
-  text: string;
-  type:
-    | 'PRODUCT'
-    | 'CATEGORY'
-    | 'BRAND'
-    | 'PRICE'
-    | 'FEATURE'
-    | 'LOCATION'
-    | 'PERSON';
-  confidence: number;
-  startIndex: number;
-  endIndex: number;
-  metadata: Record<string, any>;
-}
-
-export interface IntentClassification {
-  intent: string;
-  confidence: number;
-  entities: ExtractedEntity[];
-  metadata: Record<string, any>;
-}
-
-export interface TextSummary {
-  summary: string;
-  keyPoints: string[];
-  sentiment: 'positive' | 'negative' | 'neutral';
-  confidence: number;
-}
-
-export interface EmbeddingResult {
-  vector: number[];
-  dimensions: number;
-  model: string;
-  provider: 'gemini' | 'ollama';
-  processingTime: number;
-}
-
-// Ollama-specific interfaces
-export interface OllamaGenerateRequest {
-  model: string;
-  prompt: string;
-  context?: number[];
-  stream?: boolean;
-  options?: {
-    temperature?: number;
-    top_p?: number;
-    top_k?: number;
-    repeat_penalty?: number;
-    seed?: number;
-    num_ctx?: number;
-  };
-}
-
-export interface OllamaGenerateResponse {
-  model: string;
-  created_at: string;
-  response: string;
-  done: boolean;
-  context?: number[];
-  total_duration?: number;
-  load_duration?: number;
-  prompt_eval_count?: number;
-  prompt_eval_duration?: number;
-  eval_count?: number;
-  eval_duration?: number;
-}
-
-export interface OllamaEmbedRequest {
-  model: string;
-  prompt: string;
-}
-
-export interface OllamaEmbedResponse {
-  embedding: number[];
-}
-
-interface CacheEntry {
-  response: any;
-  timestamp: number;
-  ttl: number;
-}
-
-class GeminiRateLimitManager {
-  private requestCounts = new Map<string, number>();
-  private tokenCounts = new Map<string, number>();
-  private dailyRequestCount = 0;
-  private lastResetTime = new Map<string, number>();
-  private lastDailyReset = Date.now();
-
-  private readonly MINUTE_MS = 60 * 1000;
-  private readonly DAY_MS = 24 * 60 * 60 * 1000;
-
-  // Conservative Gemini Free Tier Limits
-  private readonly LIMITS = {
-    requestsPerMinute: 10, // Very conservative (actual: 15)
-    tokensPerMinute: 800, // Conservative for input tokens
-    requestsPerDay: 1000, // Conservative (actual: 1500)
-  };
-
-  canMakeRequest(estimatedTokens: number = 100): {
-    allowed: boolean;
-    reason?: string;
-    waitTime?: number;
-  } {
-    const now = Date.now();
-
-    // Reset daily counter
-    if (now - this.lastDailyReset >= this.DAY_MS) {
-      this.dailyRequestCount = 0;
-      this.lastDailyReset = now;
-    }
-
-    // Check daily limit
-    if (this.dailyRequestCount >= this.LIMITS.requestsPerDay) {
-      return {
-        allowed: false,
-        reason: 'Daily request limit exceeded',
-        waitTime: this.DAY_MS - (now - this.lastDailyReset),
-      };
-    }
-
-    // Reset minute counters
-    const requestKey = 'requests_per_minute';
-    const tokenKey = 'tokens_per_minute';
-
-    const lastRequestReset = this.lastResetTime.get(requestKey) || 0;
-    const lastTokenReset = this.lastResetTime.get(tokenKey) || 0;
-
-    if (now - lastRequestReset >= this.MINUTE_MS) {
-      this.requestCounts.set(requestKey, 0);
-      this.lastResetTime.set(requestKey, now);
-    }
-
-    if (now - lastTokenReset >= this.MINUTE_MS) {
-      this.tokenCounts.set(tokenKey, 0);
-      this.lastResetTime.set(tokenKey, now);
-    }
-
-    const currentRequests = this.requestCounts.get(requestKey) || 0;
-    const currentTokens = this.tokenCounts.get(tokenKey) || 0;
-
-    // Check per-minute request limit
-    if (currentRequests >= this.LIMITS.requestsPerMinute) {
-      const waitTime = this.MINUTE_MS - (now - lastRequestReset);
-      return {
-        allowed: false,
-        reason: 'Per-minute request limit exceeded',
-        waitTime,
-      };
-    }
-
-    // Check per-minute token limit
-    if (currentTokens + estimatedTokens > this.LIMITS.tokensPerMinute) {
-      const waitTime = this.MINUTE_MS - (now - lastTokenReset);
-      return {
-        allowed: false,
-        reason: 'Per-minute token limit exceeded',
-        waitTime,
-      };
-    }
-
-    return { allowed: true };
-  }
-
-  recordRequest(tokensUsed: number = 100): void {
-    const requestKey = 'requests_per_minute';
-    const tokenKey = 'tokens_per_minute';
-
-    const currentRequests = this.requestCounts.get(requestKey) || 0;
-    const currentTokens = this.tokenCounts.get(tokenKey) || 0;
-
-    this.requestCounts.set(requestKey, currentRequests + 1);
-    this.tokenCounts.set(tokenKey, currentTokens + tokensUsed);
-    this.dailyRequestCount++;
-  }
-
-  getStatus() {
-    const now = Date.now();
-    const requestKey = 'requests_per_minute';
-    const tokenKey = 'tokens_per_minute';
-
-    return {
-      requestsThisMinute: this.requestCounts.get(requestKey) || 0,
-      tokensThisMinute: this.tokenCounts.get(tokenKey) || 0,
-      requestsToday: this.dailyRequestCount,
-      limits: this.LIMITS,
-    };
-  }
-}
-
-class SimpleCache {
-  private cache = new Map<string, CacheEntry>();
-  private readonly DEFAULT_TTL = 5 * 60 * 1000; // 5 minutes
-
-  set(key: string, value: any, ttl: number = this.DEFAULT_TTL): void {
-    this.cache.set(key, {
-      response: value,
-      timestamp: Date.now(),
-      ttl,
-    });
-  }
-
-  get(key: string): any | null {
-    const entry = this.cache.get(key);
-    if (!entry) return null;
-
-    if (Date.now() - entry.timestamp > entry.ttl) {
-      this.cache.delete(key);
-      return null;
-    }
-
-    return entry.response;
-  }
-
-  clear(): void {
-    this.cache.clear();
-  }
-
-  private generateKey(input: string, type: string): string {
-    // Simple hash function for cache key
-    let hash = 0;
-    for (let i = 0; i < input.length; i++) {
-      const char = input.charCodeAt(i);
-      hash = (hash << 5) - hash + char;
-      hash = hash & hash; // Convert to 32-bit integer
-    }
-    return `${type}_${Math.abs(hash)}`;
-  }
-
-  getCacheKey(input: string, type: string): string {
-    return this.generateKey(input.substring(0, 200), type); // Limit input length for key
-  }
-}
+// Import domain entities
+import { IntentClassification } from './domain/intent-classification';
+import { ExtractedEntity } from './domain/extracted-entity';
+import { QueryAnalysis } from './domain/query-analysis';
+import { ShoppingResponse } from './domain/shopping-response';
+import { OllamaRequest, OllamaRequestOptions, OllamaResponse } from './domain';
 
 @Injectable()
-export class AIService {
+export class AIService implements OnModuleInit {
   private readonly logger = new Logger(AIService.name);
-  private readonly geminiClient: GoogleGenerativeAI;
-  private readonly ollamaClient: AxiosInstance;
-  private readonly rateLimitManager = new GeminiRateLimitManager();
-  private readonly cache = new SimpleCache();
-
-  // Configuration
-  private readonly preferredProvider: 'gemini' | 'ollama';
   private readonly ollamaBaseUrl: string;
-  private readonly geminiModel: string;
-  private readonly geminiEmbeddingModel: string;
-  private readonly ollamaChatModel: string;
-  private readonly ollamaEmbeddingModel: string;
-  private readonly temperature: number;
-  private readonly maxTokens: number;
-  private readonly topP: number;
-  private readonly topK: number;
+  private readonly ollamaModel: string;
+  private conversationContext: number[] = [];
+  private isOllamaAvailable = false;
 
-  constructor(private readonly configService: ConfigService<AllConfigType>) {
-    // Initialize Gemini
-    const geminiApiKey = this.configService.get('app.gemini.apiKey', {
+  constructor(
+    private readonly configService: ConfigService<AllConfigType>,
+    private readonly httpService: HttpService,
+  ) {
+    this.ollamaBaseUrl = this.configService.getOrThrow('app.ollama.baseUrl', {
       infer: true,
     });
-    if (geminiApiKey) {
-      this.geminiClient = new GoogleGenerativeAI(geminiApiKey);
-    }
-
-    // Initialize Ollama
-    this.ollamaBaseUrl =
-      this.configService.get('app.ollama.baseUrl', { infer: true }) ||
-      'http://localhost:11434';
-    this.ollamaClient = axios.create({
-      baseURL: this.ollamaBaseUrl,
-      timeout: 30000,
-      headers: {
-        'Content-Type': 'application/json',
-      },
+    this.ollamaModel = this.configService.getOrThrow('app.ollama.chatModel', {
+      infer: true,
     });
-
-    // Model configuration
-    this.preferredProvider =
-      this.configService.get('app.ai.preferredProvider', { infer: true }) ||
-      'ollama';
-    this.geminiModel =
-      this.configService.get('app.gemini.model', { infer: true }) ||
-      'gemini-1.5-flash';
-    this.geminiEmbeddingModel =
-      this.configService.get('app.gemini.embeddingModel', { infer: true }) ||
-      'text-embedding-004';
-    this.ollamaChatModel =
-      this.configService.get('app.ollama.chatModel', { infer: true }) ||
-      'llama3.2:latest';
-    this.ollamaEmbeddingModel =
-      this.configService.get('app.ollama.embeddingModel', { infer: true }) ||
-      'nomic-embed-text:latest';
-
-    // Generation parameters
-    this.temperature =
-      this.configService.get('app.gemini.temperature', { infer: true }) || 0.7;
-    this.maxTokens =
-      this.configService.get('app.gemini.maxTokens', { infer: true }) || 500;
-    this.topP =
-      this.configService.get('app.gemini.topP', { infer: true }) || 0.95;
-    this.topK =
-      this.configService.get('app.gemini.topK', { infer: true }) || 40;
   }
 
-  async generateResponse(
-    prompt: string,
-    conversationHistory?: ChatMessage[],
-    customOptions?: {
-      temperature?: number;
-      maxTokens?: number;
-      model?: string;
-      topP?: number;
-      topK?: number;
-      useCache?: boolean;
-      provider?: 'gemini' | 'ollama' | 'auto';
-    },
-  ): Promise<AIResponse> {
-    const startTime = Date.now();
-    const useCache = customOptions?.useCache !== false;
-    const provider = customOptions?.provider || this.preferredProvider;
-
-    try {
-      // Check cache first
-      if (useCache) {
-        const cacheKey = this.cache.getCacheKey(
-          `${provider}_${prompt}`,
-          'response',
-        );
-        const cachedResponse = this.cache.get(cacheKey);
-        if (cachedResponse) {
-          return {
-            ...cachedResponse,
-            fromCache: true,
-            processingTime: Date.now() - startTime,
-          };
-        }
-      }
-
-      let response: AIResponse;
-
-      // Determine which provider to use
-      if (provider === 'auto') {
-        // Try Ollama first (local), fallback to Gemini
-        try {
-          response = await this.generateOllamaResponse(
-            prompt,
-            conversationHistory,
-            customOptions,
-            startTime,
-          );
-        } catch (error) {
-          this.logger.warn(
-            'Ollama failed, falling back to Gemini:',
-            error.message,
-          );
-          response = await this.generateGeminiResponse(
-            prompt,
-            conversationHistory,
-            customOptions,
-            startTime,
-          );
-        }
-      } else if (provider === 'ollama') {
-        response = await this.generateOllamaResponse(
-          prompt,
-          conversationHistory,
-          customOptions,
-          startTime,
-        );
-      } else {
-        response = await this.generateGeminiResponse(
-          prompt,
-          conversationHistory,
-          customOptions,
-          startTime,
-        );
-      }
-
-      // FIX: Ensure response.content is never undefined
-      if (!response.content || typeof response.content !== 'string') {
-        this.logger.warn('Generated response has empty or invalid content');
-        response = this.getFallbackResponse(prompt, startTime);
-      }
-
-      // Cache the response
-      if (useCache) {
-        const cacheKey = this.cache.getCacheKey(
-          `${provider}_${prompt}`,
-          'response',
-        );
-        this.cache.set(cacheKey, response, 5 * 60 * 1000); // 5 minutes cache
-      }
-
-      return response;
-    } catch (error) {
-      this.logger.error(`Error generating response with ${provider}:`, error);
-      return this.getFallbackResponse(prompt, startTime);
-    }
+  async onModuleInit() {
+    await this.checkOllamaHealth();
   }
 
-  private async generateOllamaResponse(
-    prompt: string,
-    conversationHistory?: ChatMessage[],
-    customOptions?: any,
-    startTime?: number,
-  ): Promise<AIResponse> {
-    const requestStartTime = startTime || Date.now();
-
-    try {
-      this.logger.log(
-        `Starting Ollama generation for prompt: "${prompt.substring(0, 100)}..."`,
-      );
-
-      await this.checkOllamaHealth();
-
-      const fullPrompt = this.buildOllamaPrompt(prompt, conversationHistory);
-
-      const ollamaRequest: OllamaGenerateRequest = {
-        model: customOptions?.model || this.ollamaChatModel,
-        prompt: fullPrompt,
-        stream: false,
-        options: {
-          temperature: customOptions?.temperature || this.temperature,
-          top_p: customOptions?.topP || this.topP,
-          top_k: customOptions?.topK || this.topK,
-          num_ctx: Math.min(customOptions?.maxTokens || this.maxTokens, 4096),
-        },
-      };
-
-      this.logger.log(
-        `Sending request to Ollama with model: ${ollamaRequest.model}`,
-      );
-
-      const response = await this.ollamaClient.post<OllamaGenerateResponse>(
-        '/api/generate',
-        ollamaRequest,
-        { timeout: 30000 },
-      );
-
-      const ollamaResponse = response.data;
-      const processingTime = Date.now() - requestStartTime;
-      const tokensUsed =
-        (ollamaResponse.eval_count || 0) +
-        (ollamaResponse.prompt_eval_count || 0);
-
-      // FIX: Use improved validation method
-      const content = this.validateOllamaResponse(ollamaResponse);
-
-      if (!content) {
-        this.logger.warn('Ollama response validation failed, using fallback');
-        return this.getFallbackResponse(prompt, requestStartTime);
-      }
-
-      this.logger.log(
-        `Ollama generation completed successfully in ${processingTime}ms`,
-      );
-
-      return {
-        content,
-        tokensUsed,
-        processingTime,
-        model: ollamaRequest.model,
-        provider: 'ollama',
-        fromCache: false,
-      };
-    } catch (error) {
-      this.logger.error('Ollama generation failed:', error.message);
-      this.logger.warn('Using intelligent fallback due to Ollama failure');
-      return this.getFallbackResponse(prompt, requestStartTime);
-    }
-  }
-
-  private async generateGeminiResponse(
-    prompt: string,
-    conversationHistory?: ChatMessage[],
-    customOptions?: any,
-    startTime?: number,
-  ): Promise<AIResponse> {
-    if (!this.geminiClient) {
-      throw new Error('Gemini client not initialized - API key missing');
-    }
-
-    // Estimate token usage
-    const estimatedTokens =
-      this.estimateTokenCount(prompt) + (conversationHistory?.length || 0) * 50;
-
-    // Check rate limits
-    const rateLimitCheck =
-      this.rateLimitManager.canMakeRequest(estimatedTokens);
-
-    if (!rateLimitCheck.allowed) {
-      this.logger.warn(`Gemini rate limit exceeded: ${rateLimitCheck.reason}`);
-      return this.getRateLimitResponse(rateLimitCheck, startTime || Date.now());
-    }
-
-    const modelName = customOptions?.model || this.geminiModel;
-    const generativeModel: GenerativeModel =
-      this.geminiClient.getGenerativeModel({
-        model: modelName,
-        generationConfig: {
-          temperature: customOptions?.temperature || this.temperature,
-          maxOutputTokens: Math.min(
-            customOptions?.maxTokens || this.maxTokens,
-            500,
-          ),
-          topP: customOptions?.topP || this.topP,
-          topK: customOptions?.topK || this.topK,
-        },
-        systemInstruction: this.getSystemPrompt(),
-      });
-
-    // Optimize prompt to reduce token usage
-    let optimizedPrompt = this.optimizePrompt(prompt);
-
-    if (conversationHistory && conversationHistory.length > 0) {
-      // Limit conversation history to last 2 exchanges to save tokens
-      const recentHistory = conversationHistory
-        .filter((msg) => msg.role !== 'system')
-        .slice(-2)
-        .map(
-          (msg) =>
-            `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content.substring(0, 200)}`,
-        )
-        .join('\n');
-      optimizedPrompt = `${recentHistory}\nUser: ${optimizedPrompt}`;
-    }
-
-    const result = await generativeModel.generateContent(optimizedPrompt);
-    const response = await result.response;
-    const content = response.text();
-
-    const processingTime = startTime ? Date.now() - startTime : 0;
-    const tokensUsed = this.estimateTokenCount(content + optimizedPrompt);
-
-    // Record the request
-    this.rateLimitManager.recordRequest(tokensUsed);
-
-    return {
-      content,
-      tokensUsed,
-      processingTime,
-      model: modelName,
-      provider: 'gemini',
-      fromCache: false,
-    };
-  }
-
-  async generateEmbedding(
-    text: string,
-    customOptions?: {
-      model?: string;
-      provider?: 'gemini' | 'ollama' | 'auto';
-    },
-  ): Promise<EmbeddingResult> {
-    const startTime = Date.now();
-    const provider = customOptions?.provider || this.preferredProvider;
-
-    try {
-      // Check cache first
-      const cacheKey = this.cache.getCacheKey(
-        `${provider}_${text}`,
-        'embedding',
-      );
-      const cachedEmbedding = this.cache.get(cacheKey);
-      if (cachedEmbedding) {
-        return cachedEmbedding;
-      }
-
-      let result: EmbeddingResult;
-
-      if (provider === 'auto') {
-        // Try Ollama first, fallback to Gemini
-        try {
-          result = await this.generateOllamaEmbedding(
-            text,
-            customOptions?.model,
-          );
-        } catch (error) {
-          this.logger.warn(
-            'Ollama embedding failed, falling back to Gemini:',
-            error.message,
-          );
-          result = await this.generateGeminiEmbedding(
-            text,
-            customOptions?.model,
-          );
-        }
-      } else if (provider === 'ollama') {
-        result = await this.generateOllamaEmbedding(text, customOptions?.model);
-      } else {
-        result = await this.generateGeminiEmbedding(text, customOptions?.model);
-      }
-
-      // Cache the embedding
-      this.cache.set(cacheKey, result, 30 * 60 * 1000); // 30 minutes cache
-
-      return result;
-    } catch (error) {
-      this.logger.error(`Error generating embedding with ${provider}:`, error);
-
-      // Return a fallback embedding
-      const fallbackVector = new Array(768)
-        .fill(0)
-        .map(() => Math.random() - 0.5);
-      return {
-        vector: fallbackVector,
-        dimensions: fallbackVector.length,
-        model: 'fallback',
-        provider: 'ollama',
-        processingTime: Date.now() - startTime,
-      };
-    }
-  }
-
-  private async generateOllamaEmbedding(
-    text: string,
-    customModel?: string,
-  ): Promise<EmbeddingResult> {
-    const startTime = Date.now();
-
-    try {
-      await this.checkOllamaHealth();
-
-      const model = customModel || this.ollamaEmbeddingModel;
-      const truncatedText = text.substring(0, 1000); // Limit text length
-
-      const request: OllamaEmbedRequest = {
-        model,
-        prompt: truncatedText,
-      };
-
-      const response = await this.ollamaClient.post<OllamaEmbedResponse>(
-        '/api/embeddings',
-        request,
-      );
-      const ollamaResponse = response.data;
-
-      if (!ollamaResponse.embedding || ollamaResponse.embedding.length === 0) {
-        throw new Error('Failed to generate embedding: empty vector received');
-      }
-
-      const processingTime = Date.now() - startTime;
-
-      return {
-        vector: ollamaResponse.embedding,
-        dimensions: ollamaResponse.embedding.length,
-        model,
-        provider: 'ollama',
-        processingTime,
-      };
-    } catch (error) {
-      this.logger.error('Ollama embedding generation failed:', error);
-      throw new Error(`Ollama embedding failed: ${error.message}`);
-    }
-  }
-
-  private async generateGeminiEmbedding(
-    text: string,
-    customModel?: string,
-  ): Promise<EmbeddingResult> {
-    const startTime = Date.now();
-
-    if (!this.geminiClient) {
-      throw new Error('Gemini client not initialized - API key missing');
-    }
-
-    try {
-      // Check rate limits
-      const estimatedTokens = this.estimateTokenCount(text);
-      const rateLimitCheck =
-        this.rateLimitManager.canMakeRequest(estimatedTokens);
-
-      if (!rateLimitCheck.allowed) {
-        this.logger.warn('Rate limit exceeded for Gemini embedding generation');
-        throw new Error('Rate limit exceeded');
-      }
-
-      const modelName = customModel || this.geminiEmbeddingModel;
-      const embeddingModel = this.geminiClient.getGenerativeModel({
-        model: modelName,
-      });
-
-      // Truncate text if too long
-      const truncatedText = text.substring(0, 1000);
-
-      const result = await embeddingModel.embedContent(truncatedText);
-      const embedding = result.embedding;
-
-      if (!embedding || !embedding.values || embedding.values.length === 0) {
-        throw new Error('Failed to generate embedding: empty vector received');
-      }
-
-      const processingTime = Date.now() - startTime;
-      this.rateLimitManager.recordRequest(estimatedTokens);
-
-      return {
-        vector: embedding.values,
-        dimensions: embedding.values.length,
-        model: modelName,
-        provider: 'gemini',
-        processingTime,
-      };
-    } catch (error) {
-      this.logger.error('Gemini embedding generation failed:', error);
-      throw new Error(`Gemini embedding failed: ${error.message}`);
-    }
-  }
-
-  // Ollama utility methods
+  /**
+   * Check if Ollama is available and the model is loaded
+   */
   private async checkOllamaHealth(): Promise<void> {
     try {
-      await this.ollamaClient.get('/api/tags');
-    } catch (error) {
-      throw new Error(
-        `Ollama is not available at ${this.ollamaBaseUrl}. Please ensure Ollama is running.`,
+      this.logger.log('Checking Ollama availability...');
+
+      const response = await firstValueFrom(
+        this.httpService.get(`${this.ollamaBaseUrl}/api/tags`),
       );
-    }
-  }
 
-  async listOllamaModels(): Promise<{
-    models: Array<{ name: string; size: number; digest: string }>;
-  }> {
-    try {
-      const response = await this.ollamaClient.get('/api/tags');
-      return response.data;
-    } catch (error) {
-      this.logger.error('Failed to list Ollama models:', error);
-      throw new Error(`Failed to list Ollama models: ${error.message}`);
-    }
-  }
+      if (response.status === 200) {
+        const models = response.data.models || [];
+        const modelExists = models.some((model: any) =>
+          model.name.includes(this.ollamaModel),
+        );
 
-  async checkOllamaModelExists(modelName: string): Promise<boolean> {
-    try {
-      const models = await this.listOllamaModels();
-      return models.models.some((model) => model.name.includes(modelName));
-    } catch (error) {
-      this.logger.error(`Failed to check if model ${modelName} exists:`, error);
-      return false;
-    }
-  }
-
-  async pullOllamaModel(modelName: string): Promise<void> {
-    try {
-      await this.ollamaClient.post('/api/pull', { name: modelName });
-    } catch (error) {
-      this.logger.error(`Failed to pull model ${modelName}:`, error);
-      throw new Error(`Failed to pull model ${modelName}: ${error.message}`);
-    }
-  }
-
-  private buildOllamaPrompt(
-    prompt: string,
-    conversationHistory?: ChatMessage[],
-  ): string {
-    let fullPrompt = this.getSystemPrompt() + '\n\n';
-
-    // Add conversation history
-    if (conversationHistory && conversationHistory.length > 0) {
-      fullPrompt += 'Previous conversation:\n';
-      conversationHistory.slice(-5).forEach((msg) => {
-        // Keep last 5 messages
-        if (msg.role !== 'system') {
-          fullPrompt += `${msg.role === 'user' ? 'Human' : 'Assistant'}: ${msg.content}\n`;
-        }
-      });
-      fullPrompt += '\n';
-    }
-
-    // Add current prompt
-    fullPrompt += `Human: ${prompt}\n\nAssistant: `;
-
-    return fullPrompt;
-  }
-
-  // Enhanced utility methods with provider support
-  async classifyIntent(
-    text: string,
-    customIntents?: string[],
-  ): Promise<IntentClassification> {
-    const startTime = Date.now();
-
-    try {
-      const intents = customIntents || this.getDefaultIntents();
-
-      // FIX: Use simpler prompt that doesn't require JSON parsing for Ollama
-      const prompt = `
-    Classify the intent of this message into one of these categories: ${intents.join(', ')}
-    
-    Message: "${text}"
-    
-    Reply with just the intent name, followed by a confidence score (0-1), then a brief reason.
-    Format: INTENT_NAME|0.95|reason here
-    `;
-
-      const response = await this.generateResponse(prompt);
-
-      // FIX: Parse simple format instead of JSON
-      try {
-        const lines = response.content.trim().split('\n');
-        const firstLine = lines[0].trim();
-
-        if (firstLine.includes('|')) {
-          const [intentPart, confidencePart, ...reasonParts] =
-            firstLine.split('|');
-          const intent = intentPart.trim().toUpperCase();
-          const confidence = parseFloat(confidencePart.trim()) || 0.8;
-          const reasoning = reasonParts.join('|').trim() || 'AI classification';
-
-          const processingTime = Date.now() - startTime;
-
+        if (modelExists) {
+          this.isOllamaAvailable = true;
           this.logger.log(
-            `Intent classified as '${intent}' with confidence ${confidence} in ${processingTime}ms`,
+            `✅ Ollama is available with model: ${this.ollamaModel}`,
           );
-
-          return {
-            intent: intents.includes(intent) ? intent : 'OTHER',
-            confidence,
-            entities: [],
-            metadata: {
-              reasoning,
-              processingTime,
-              originalText: text,
-            },
-          };
         } else {
-          // Fallback: try to find intent in the response
-          const foundIntent = intents.find((intent) =>
-            response.content.toUpperCase().includes(intent),
+          this.logger.warn(
+            `⚠️ Model ${this.ollamaModel} not found. Available models: ${models.map((m: any) => m.name).join(', ')}`,
           );
-
-          return {
-            intent: foundIntent || 'OTHER',
-            confidence: 0.6,
-            entities: [],
-            metadata: {
-              reasoning: 'Fallback pattern matching',
-              processingTime: Date.now() - startTime,
-              originalText: text,
-              rawResponse: response.content,
-            },
-          };
         }
-      } catch (parseError) {
-        this.logger.warn(
-          'Failed to parse enhanced intent response, using simple classification',
-        );
-
-        // FIX: Fallback to simple pattern matching
-        return this.classifyIntentSimple(text, customIntents);
       }
     } catch (error) {
-      this.logger.error('Error in enhanced intent classification:', error);
-      return this.classifyIntentSimple(text, customIntents);
-    }
-  }
-
-  async generateContextualResponse(
-    query: string,
-    context: string[],
-    conversationHistory?: ChatMessage[],
-    provider?: 'gemini' | 'ollama' | 'auto',
-  ): Promise<AIResponse> {
-    try {
-      // Optimize context to reduce token usage
-      const limitedContext = context
-        .slice(0, 3) // Increased context for better RAG
-        .map((ctx) => ctx.substring(0, 200))
-        .join(' | ');
-      const contextSection = limitedContext
-        ? `Context: ${limitedContext}\n\n`
-        : '';
-
-      const enhancedPrompt = `${contextSection}User: ${query}`;
-
-      return await this.generateResponse(
-        enhancedPrompt,
-        conversationHistory?.slice(-2), // Keep last 2 exchanges
-        {
-          useCache: true,
-          provider: provider || this.preferredProvider,
-        },
-      );
-    } catch (error) {
-      this.logger.error('Error generating contextual response:', error);
-      throw new Error(
-        `Failed to generate contextual response: ${error.message}`,
-      );
-    }
-  }
-
-  // System status and debugging
-  async getSystemStatus(): Promise<{
-    providers: {
-      gemini: {
-        available: boolean;
-        rateLimitStatus?: {
-          requestsThisMinute: number;
-          tokensThisMinute: number;
-          requestsToday: number;
-          limits: {
-            requestsPerMinute: number;
-            tokensPerMinute: number;
-            requestsPerDay: number;
-          };
-        };
-      };
-      ollama: {
-        available: boolean;
-        models?: {
-          models: Array<{
-            name: string;
-            size: number;
-            digest: string;
-          }>;
-        };
-      };
-    };
-    preferredProvider: string;
-    cache: { size: number };
-  }> {
-    const status: {
-      providers: {
-        gemini: {
-          available: boolean;
-          rateLimitStatus?: {
-            requestsThisMinute: number;
-            tokensThisMinute: number;
-            requestsToday: number;
-            limits: {
-              requestsPerMinute: number;
-              tokensPerMinute: number;
-              requestsPerDay: number;
-            };
-          };
-        };
-        ollama: {
-          available: boolean;
-          models?: {
-            models: Array<{
-              name: string;
-              size: number;
-              digest: string;
-            }>;
-          };
-        };
-      };
-      preferredProvider: string;
-      cache: { size: number };
-    } = {
-      providers: {
-        gemini: { available: false },
-        ollama: { available: false },
-      },
-      preferredProvider: this.preferredProvider,
-      cache: { size: this.cache['cache'].size },
-    };
-
-    // Check Gemini
-    try {
-      if (this.geminiClient) {
-        status.providers.gemini.available = true;
-        status.providers.gemini.rateLimitStatus =
-          this.rateLimitManager.getStatus();
-      }
-    } catch (error) {
-      this.logger.warn('Gemini status check failed:', error);
-    }
-
-    // Check Ollama
-    try {
-      await this.checkOllamaHealth();
-      status.providers.ollama.available = true;
-      status.providers.ollama.models = await this.listOllamaModels();
-    } catch (error) {
-      this.logger.warn('Ollama status check failed:', error);
-    }
-
-    return status;
-  }
-
-  // Existing methods remain the same...
-  extractEntities(
-    text: string,
-    customEntityTypes?: string[],
-  ): ExtractedEntity[] {
-    try {
-      // Use pattern matching for basic entity extraction to save tokens
-      const entities: ExtractedEntity[] = [];
-
-      // Price patterns
-      const priceMatches = text.match(/\$[\d,]+\.?\d*/g);
-      if (priceMatches) {
-        priceMatches.forEach((match) => {
-          const startIndex = text.indexOf(match);
-          entities.push({
-            text: match,
-            type: 'PRICE',
-            confidence: 0.9,
-            startIndex,
-            endIndex: startIndex + match.length,
-            metadata: { extractionMethod: 'regex' },
-          });
-        });
-      }
-
-      // Product/brand patterns (simple capitalized words)
-      const productMatches = text.match(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b/g);
-      if (productMatches) {
-        productMatches.slice(0, 3).forEach((match) => {
-          // Limit to 3 to avoid noise
-          const startIndex = text.indexOf(match);
-          entities.push({
-            text: match,
-            type: 'PRODUCT',
-            confidence: 0.6,
-            startIndex,
-            endIndex: startIndex + match.length,
-            metadata: { extractionMethod: 'regex' },
-          });
-        });
-      }
-
-      return entities;
-    } catch (error) {
-      this.logger.error('Error extracting entities:', error);
-      return [];
-    }
-  }
-
-  async summarizeText(
-    text: string,
-    maxSentences?: number,
-    provider?: 'gemini' | 'ollama' | 'auto',
-  ): Promise<TextSummary> {
-    try {
-      const shortPrompt = `Summarize in ${maxSentences || 2} sentences: "${text.substring(0, 300)}"`;
-
-      const response = await this.generateResponse(shortPrompt, undefined, {
-        maxTokens: 100,
-        useCache: true,
-        provider: provider || this.preferredProvider,
-      });
-
-      return {
-        summary: response.content,
-        keyPoints: [response.content],
-        sentiment: 'neutral',
-        confidence: response.fromCache ? 0.9 : 0.7,
-      };
-    } catch (error) {
-      this.logger.error('Error summarizing text:', error);
-      return {
-        summary: text.substring(0, 200) + '...',
-        keyPoints: [],
-        sentiment: 'neutral',
-        confidence: 0.3,
-      };
-    }
-  }
-
-  async translateText(
-    text: string,
-    targetLanguage: string,
-    sourceLanguage?: string,
-    provider?: 'gemini' | 'ollama' | 'auto',
-  ): Promise<{
-    translatedText: string;
-    sourceLanguage: string;
-    targetLanguage: string;
-    confidence: number;
-  }> {
-    try {
-      const shortPrompt = `Translate to ${targetLanguage}: "${text.substring(0, 200)}"`;
-
-      const response = await this.generateResponse(shortPrompt, undefined, {
-        maxTokens: Math.min(200, text.length * 2),
-        useCache: true,
-        provider: provider || this.preferredProvider,
-      });
-
-      return {
-        translatedText: response.content,
-        sourceLanguage: sourceLanguage || 'auto-detected',
-        targetLanguage,
-        confidence: response.fromCache ? 0.9 : 0.7,
-      };
-    } catch (error) {
-      this.logger.error('Error translating text:', error);
-      return {
-        translatedText: text,
-        sourceLanguage: sourceLanguage || 'unknown',
-        targetLanguage,
-        confidence: 0.3,
-      };
-    }
-  }
-
-  async generateSuggestions(
-    context: string,
-    numberOfSuggestions: number = 3,
-    provider?: 'gemini' | 'ollama' | 'auto',
-  ): Promise<string[]> {
-    try {
-      // Check if it's watch-related for specialized suggestions
-      const isWatchQuery = this.isWatchRelated(context);
-
-      if (isWatchQuery) {
-        // Use simple watch-focused prompt
-        const watchPrompt = `Customer is asking about watches: "${context}". 
-    Provide ${numberOfSuggestions} helpful watch-related suggestions. Each on a new line with a number.`;
-
-        const response = await this.generateResponse(watchPrompt, undefined, {
-          maxTokens: 150,
-          useCache: true,
-          provider: provider || this.preferredProvider,
-        });
-
-        if (response.content) {
-          const suggestions = response.content
-            .split('\n')
-            .filter((line) => line.trim().length > 0)
-            .map((line) => line.replace(/^\d+\.?\s*/, '').trim())
-            .filter((suggestion) => suggestion.length > 0)
-            .slice(0, numberOfSuggestions);
-
-          if (suggestions.length > 0) {
-            return suggestions;
-          }
-        }
-
-        // Fallback to simple watch suggestions
-        return this.getSimpleWatchSuggestions(context);
-      }
-
-      // For general queries, use shorter prompt to save tokens
-      const shortPrompt = `Based on: "${context.substring(0, 200)}", provide ${numberOfSuggestions} helpful suggestions. Format as numbered list.`;
-
-      const response = await this.generateResponse(shortPrompt, undefined, {
-        maxTokens: 150,
-        useCache: true,
-        provider: provider || this.preferredProvider,
-      });
-
-      if (!response.content || typeof response.content !== 'string') {
-        this.logger.warn(
-          'Empty or invalid response content in generateSuggestions',
-        );
-        return this.getDefaultSuggestions(context);
-      }
-
-      const suggestions = response.content
-        .split('\n')
-        .filter((line) => line.trim().length > 0)
-        .map((line) => line.replace(/^\d+\.?\s*/, '').trim())
-        .filter((suggestion) => suggestion.length > 0)
-        .slice(0, numberOfSuggestions);
-
-      if (suggestions.length === 0) {
-        this.logger.warn('No valid suggestions parsed, using defaults');
-        return this.getDefaultSuggestions(context);
-      }
-
-      this.logger.log(
-        `Generated ${suggestions.length} suggestions successfully`,
-      );
-      return suggestions;
-    } catch (error) {
-      this.logger.error('Error generating suggestions:', error);
-      return this.getDefaultSuggestions(context);
-    }
-  }
-
-  private isWatchRelated(context: string): boolean {
-    const watchWords = [
-      'watch',
-      'smartwatch',
-      'timepiece',
-      'rolex',
-      'apple watch',
-      'band',
-      'strap',
-    ];
-    return watchWords.some((word) => context.toLowerCase().includes(word));
-  }
-  private getSimpleWatchSuggestions(context: string): string[] {
-    const lowerContext = context.toLowerCase();
-
-    if (lowerContext.includes('smartwatch') || lowerContext.includes('apple')) {
-      return [
-        'What features do you need in a smartwatch?',
-        'Are you looking for fitness tracking or notifications?',
-        "What's your phone - iPhone or Android?",
-      ];
-    }
-
-    if (lowerContext.includes('luxury') || lowerContext.includes('rolex')) {
-      return [
-        'What occasions will you wear this watch?',
-        'Do you prefer gold or steel?',
-        'Are you interested in automatic or quartz?',
-      ];
-    }
-
-    if (lowerContext.includes('gift')) {
-      return [
-        "What's your budget for the watch gift?",
-        'Is this for a man or woman?',
-        'Do they prefer smart or traditional watches?',
-      ];
-    }
-
-    if (lowerContext.includes('band') || lowerContext.includes('strap')) {
-      return [
-        'What watch do you need a band for?',
-        'Do you prefer leather or metal bands?',
-        'What color are you looking for?',
-      ];
-    }
-
-    if (lowerContext.includes('price') || lowerContext.includes('budget')) {
-      return [
-        "What's your budget range?",
-        'Would you like to see our current deals?',
-        'Are you interested in payment plans?',
-      ];
-    }
-
-    // Default watch suggestions
-    return [
-      'Are you looking for a smartwatch or traditional watch?',
-      "What's your budget range?",
-      'Would you like to see our bestsellers?',
-    ];
-  }
-
-  private getDefaultSuggestions(context: string): string[] {
-    const lowerContext = context.toLowerCase();
-
-    if (lowerContext.includes('product') || lowerContext.includes('buy')) {
-      return [
-        'What specific features are you looking for?',
-        'Do you have a preferred price range?',
-        'Would you like to see our current deals?',
-      ];
-    } else if (
-      lowerContext.includes('price') ||
-      lowerContext.includes('cost')
-    ) {
-      return [
-        'Check our current promotions and discounts',
-        'Compare prices with similar products',
-        'Sign up for price alerts on this item',
-      ];
-    } else if (
-      lowerContext.includes('recommend') ||
-      lowerContext.includes('suggest')
-    ) {
-      return [
-        'Tell me about your preferences',
-        'What will you use this for?',
-        'Do you have a favorite brand?',
-      ];
-    } else if (
-      lowerContext.includes('compare') ||
-      lowerContext.includes('vs')
-    ) {
-      return [
-        'What factors are most important to you?',
-        'Would you like to see detailed specifications?',
-        'Should I add more products to compare?',
-      ];
-    } else {
-      return [
-        'How can I help you further?',
-        'Would you like product recommendations?',
-        'Do you have other questions?',
-      ];
+      this.logger.error('❌ Ollama not available:', error.message);
+      this.isOllamaAvailable = false;
     }
   }
 
   /**
-   * Determines whether suggestions should be generated based on intent and confidence
+   * Main query analysis method - combines intent classification and entity extraction
+   * @param query User's text query
+   * @returns Complete analysis with intent and entities
    */
-  private shouldGenerateSuggestions(
-    intent: string,
-    confidence: number,
-  ): boolean {
-    // Don't generate suggestions for low confidence classifications
-    if (confidence < 0.6) {
-      this.logger.log(`Low confidence (${confidence}) - skipping suggestions`);
-      return false;
-    }
-
-    // Define intents that DON'T need suggestions
-    const intentsThatDontNeedSuggestions = new Set([
-      'GREETING', // Simple greeting, no suggestions needed
-      'THANK_YOU', // User saying thanks, no suggestions needed
-      'GOODBYE', // User ending conversation, no suggestions needed
-      'CONFIRMATION', // User confirming something, no suggestions needed
-      'ORDER_STATUS', // User checking order, specific info request
-      'SIMPLE_QUESTION', // Direct question with clear answer
-      'COMPLETED_PURCHASE', // User completed purchase, no more suggestions needed
-    ]);
-
-    // Define intents that DO need suggestions
-    const intentsThatNeedSuggestions = new Set([
-      'PRODUCT_SEARCH', // User is searching, might need refinement suggestions
-      'RECOMMENDATION', // User wants recommendations, offer alternatives
-      'PRICE_INQUIRY', // User asking about price, suggest related products/deals
-      'COMPARISON', // User comparing products, suggest other comparisons
-      'AVAILABILITY', // User checking availability, suggest alternatives
-      'SUPPORT', // User needs help, offer specific help options
-      'OTHER', // Unknown intent, might need guidance
-    ]);
-
-    // Check if intent explicitly doesn't need suggestions
-    if (intentsThatDontNeedSuggestions.has(intent)) {
-      this.logger.log(`Intent '${intent}' doesn't require suggestions`);
-      return false;
-    }
-
-    // Check if intent explicitly needs suggestions
-    if (intentsThatNeedSuggestions.has(intent)) {
-      this.logger.log(`Intent '${intent}' requires suggestions`);
-      return true;
-    }
-
-    // For high confidence unknown intents, use additional heuristics
-    if (confidence > 0.8 && intent.includes('SEARCH')) {
-      this.logger.log(
-        `High confidence search-related intent - generating suggestions`,
-      );
-      return true;
-    }
-
-    // Medium confidence intents related to products need suggestions
-    if (
-      confidence > 0.7 &&
-      (intent.includes('PRODUCT') || intent.includes('BUY'))
-    ) {
-      this.logger.log(
-        `Product-related intent with good confidence - generating suggestions`,
-      );
-      return true;
-    }
-
-    // Default to no suggestions for unknown intents
-    this.logger.log(
-      `Intent '${intent}' with confidence ${confidence} doesn't match suggestion criteria`,
-    );
-    return false;
-  }
-
-  async analyzeQuery(
-    query: string,
-    provider?: 'gemini' | 'ollama' | 'auto',
-  ): Promise<{
-    intent: IntentClassification;
-    entities: ExtractedEntity[];
-    suggestions: string[];
-    processingTime: number;
-  }> {
+  async analyzeQuery(query: string): Promise<QueryAnalysis> {
     const startTime = Date.now();
 
     try {
       this.logger.log(`Analyzing query: ${query.substring(0, 100)}...`);
 
-      // Execute in sequence with delays to respect rate limits (only for Gemini)
-      const selectedProvider = provider || this.preferredProvider;
-
-      // Step 1: Classify intent
-      const intent = await this.classifyIntent(query, undefined);
-
-      // Small delay between requests only for Gemini
-      if (selectedProvider === 'gemini') {
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
-
-      // Step 2: Extract entities
-      const entities = await this.extractEntities(query);
-
-      // Step 3: Generate suggestions ONLY when needed based on intent
-      let suggestions: string[] = [];
-
-      if (this.shouldGenerateSuggestions(intent.intent, intent.confidence)) {
-        if (selectedProvider === 'gemini') {
-          await new Promise((resolve) => setTimeout(resolve, 100));
-        }
-
-        suggestions = await this.generateSuggestions(
-          query,
-          3,
-          selectedProvider,
-        );
-
-        this.logger.log(
-          `Generated ${suggestions.length} suggestions for intent: ${intent.intent}`,
-        );
-      } else {
-        this.logger.log(
-          `Skipped suggestion generation for intent: ${intent.intent} (confidence: ${intent.confidence})`,
-        );
-      }
+      // Run intent classification and entity extraction in parallel
+      const [intent, entities] = await Promise.all([
+        this.classifyIntent(query),
+        this.extractEntities(query),
+      ]);
 
       const processingTime = Date.now() - startTime;
 
       this.logger.log(
-        `Query analyzed in ${processingTime}ms using ${selectedProvider}`,
+        `Query analyzed in ${processingTime}ms - Intent: ${intent.intent} (${intent.confidence}), Entities: ${entities.length}`,
       );
 
-      return {
-        intent,
-        entities,
-        suggestions,
-        processingTime,
-      };
+      return new QueryAnalysis(intent, entities, processingTime);
     } catch (error) {
       this.logger.error('Error analyzing query:', error);
 
-      return {
-        intent: {
-          intent: 'OTHER',
-          confidence: 0.3,
-          entities: [],
-          metadata: { error: error.message },
-        },
-        entities: [],
-        suggestions: ['How can I help you?'], // Fallback suggestion only for errors
-        processingTime: Date.now() - startTime,
-      };
+      return new QueryAnalysis(
+        new IntentClassification(
+          'OTHER',
+          0.3,
+          `Analysis failed: ${error.message}`,
+        ),
+        [],
+        Date.now() - startTime,
+      );
     }
   }
 
-  // Shopping-specific methods enhanced for hybrid RAG-KAG
+  /**
+   * Classify user intent for luxury watch shopping
+   * @param query User's text query
+   * @returns Intent classification with confidence
+   */
+  async classifyIntent(query: string): Promise<IntentClassification> {
+    try {
+      this.logger.log(`Classifying intent for: ${query.substring(0, 50)}...`);
+
+      const prompt = `You are an expert at understanding customer intentions in a luxury watch boutique.
+
+Classify this customer query into ONE of these categories:
+
+CATEGORIES:
+- PRODUCT_SEARCH: Customer looking for specific luxury watches or timepieces
+- PRICE_INQUIRY: Customer asking about pricing information or investment value
+- BRAND_COMPARISON: Customer comparing different luxury watch brands
+- COLLECTION_INQUIRY: Customer asking about specific watch collections or series
+- AUTHENTICATION: Customer asking about authenticity or verification
+- INVESTMENT_ADVICE: Customer seeking investment guidance for watches
+- MAINTENANCE_SERVICE: Customer needs servicing, repair, or maintenance
+- WARRANTY_INQUIRY: Customer asking about warranty or guarantee
+- AVAILABILITY: Customer checking if watches are in stock
+- APPOINTMENT_REQUEST: Customer wants to schedule viewing or consultation
+- GREETING: Customer greeting or starting conversation
+- HELP_REQUEST: Customer needs general assistance
+- OTHER: Query doesn't fit other categories
+
+Customer Query: "${query}"
+
+Respond in this exact format:
+CATEGORY: [category_name]
+CONFIDENCE: [0.0 to 1.0]
+REASON: [brief explanation]
+
+Example:
+CATEGORY: PRODUCT_SEARCH
+CONFIDENCE: 0.95
+REASON: Customer is looking for a Rolex Submariner`;
+
+      const response = await this.callOllama(prompt, {
+        temperature: 0.3,
+        num_predict: 150,
+        stop: ['\n\n'],
+      });
+
+      return this.parseIntentResponse(response, query);
+    } catch (error) {
+      this.logger.error('Error classifying intent:', error);
+      return this.classifyIntentFallback(query);
+    }
+  }
+
+  /**
+   * Extract luxury watch brands, models, features, and other horological entities
+   * @param query User's text query
+   * @returns Array of extracted entities
+   */
+  async extractEntities(query: string): Promise<ExtractedEntity[]> {
+    try {
+      this.logger.log(`Extracting entities from: ${query.substring(0, 50)}...`);
+
+      const prompt = `You are an expert at identifying luxury watches and horological information.
+
+Extract watch-related entities from this customer query and categorize them:
+
+ENTITY TYPES TO FIND:
+- WATCH_BRAND: Rolex, Patek Philippe, Audemars Piguet, Omega, Cartier, etc.
+- WATCH_MODEL: Submariner, Daytona, Nautilus, Royal Oak, Speedmaster, etc.
+- WATCH_COLLECTION: Oyster Perpetual, Aquanaut, Offshore, Seamaster, etc.
+- WATCH_TYPE: diving watch, dress watch, chronograph, GMT, pilot watch, etc.
+- PRICE_RANGE: $5000, under $50k, between $100k-500k, investment grade, etc.
+- MATERIAL: gold, platinum, titanium, ceramic, steel, rose gold, etc.
+- COMPLICATION: tourbillon, perpetual calendar, minute repeater, moon phase, etc.
+- SIZE: 40mm, 42mm, case diameter, etc.
+- CONDITION: new, vintage, pre-owned, certified pre-owned, etc.
+
+Customer Query: "${query}"
+
+For each entity found, respond with one line in this format:
+ENTITY: [entity_text] | TYPE: [entity_type] | CONFIDENCE: [0.0-1.0] | POSITION: [start_index]
+
+Example:
+ENTITY: Rolex Submariner | TYPE: WATCH_MODEL | CONFIDENCE: 0.95 | POSITION: 7
+ENTITY: Rolex | TYPE: WATCH_BRAND | CONFIDENCE: 0.90 | POSITION: 7
+ENTITY: $15000 | TYPE: PRICE_RANGE | CONFIDENCE: 0.85 | POSITION: 30
+
+Only include entities with confidence > 0.7`;
+
+      const response = await this.callOllama(prompt, {
+        temperature: 0.2,
+        num_predict: 300,
+      });
+
+      const entities = this.parseEntityResponse(response, query);
+
+      // Add fallback entity extraction using patterns
+      const fallbackEntities = this.extractEntitiesFallback(query);
+      entities.push(...fallbackEntities);
+
+      // Remove duplicates
+      const uniqueEntities = this.removeDuplicateEntities(entities);
+
+      this.logger.log(`Extracted ${uniqueEntities.length} entities`);
+      return uniqueEntities;
+    } catch (error) {
+      this.logger.error('Error extracting entities:', error);
+      return this.extractEntitiesFallback(query);
+    }
+  }
+
+  /**
+   * Generate contextual luxury watch shopping response
+   * @param query User's query
+   * @param productContext Array of relevant watch information
+   * @param userPreferences User's shopping preferences and history
+   * @returns Generated response with watch recommendations
+   */
   async generateShoppingResponse(
     query: string,
     productContext: string[],
     userPreferences?: any,
-    conversationHistory?: ChatMessage[],
-    provider?: 'gemini' | 'ollama' | 'auto',
-  ): Promise<AIResponse> {
+  ): Promise<ShoppingResponse> {
     try {
-      // Build enhanced context for shopping
-      const systemContext = this.getShoppingSystemPrompt();
-      const productInfo = productContext.slice(0, 5).join('\n\n'); // Limit products
-      const preferences = userPreferences
-        ? `User preferences: ${JSON.stringify(userPreferences).substring(0, 200)}`
+      this.logger.log(
+        `Generating luxury watch response for: ${query.substring(0, 50)}...`,
+      );
+
+      const contextSection =
+        productContext.length > 0
+          ? `AVAILABLE TIMEPIECES:\n${productContext
+              .slice(0, 5)
+              .map((product, index) => `${index + 1}. ${product}`)
+              .join('\n\n')}\n`
+          : '';
+
+      const preferencesSection = userPreferences
+        ? `CLIENT PREFERENCES:\n${JSON.stringify(userPreferences, null, 2)}\n`
         : '';
 
-      const enhancedPrompt = `${systemContext}
+      const prompt = `You are a knowledgeable and sophisticated luxury watch specialist working in an exclusive horological boutique. Your expertise covers fine timepieces, investment potential, and horological craftsmanship.
 
-${preferences}
+${contextSection}
+${preferencesSection}
 
-Available products:
-${productInfo}
+CLIENT INQUIRY: "${query}"
 
-Customer query: ${query}
+GUIDELINES:
+- Be professional, knowledgeable, and sophisticated in your approach
+- If timepieces are available above, recommend specific ones that match the client's needs
+- Discuss horological complications, craftsmanship, and heritage when relevant
+- Address investment potential and market appreciation for luxury watches
+- Mention authenticity, provenance, and certification considerations
+- Provide insights about watch movements, materials, and manufacturing
+- Keep responses informative but elegant (under 250 words)
+- Always emphasize the exclusivity and craftsmanship of luxury timepieces
+- Use sophisticated horological terminology appropriately
 
-Please provide a helpful shopping response that:
-1. Addresses the customer's specific needs
-2. Recommends relevant products from the available options
-3. Explains why these products match their requirements
-4. Offers additional assistance
+Generate a refined response:`;
 
-Response:`;
+      const response = await this.callOllama(prompt, {
+        temperature: 0.7,
+        num_predict: 300,
+        top_p: 0.9,
+      });
 
-      return await this.generateResponse(
-        enhancedPrompt,
-        conversationHistory?.slice(-3), // Keep more context for shopping
-        {
-          useCache: true,
-          provider: provider || this.preferredProvider,
-          temperature: 0.7, // Slightly more creative for shopping recommendations
-        },
+      // Extract product references from context
+      const referencedProducts = this.extractProductReferences(
+        response,
+        productContext,
+      );
+
+      // Generate follow-up suggestions
+      const suggestions = await this.generateSuggestions(query, response);
+
+      return new ShoppingResponse(
+        response.trim(),
+        0.9,
+        referencedProducts,
+        suggestions,
       );
     } catch (error) {
       this.logger.error('Error generating shopping response:', error);
-      throw new Error(`Failed to generate shopping response: ${error.message}`);
+
+      return new ShoppingResponse(
+        "I apologize, but I'm having trouble processing your inquiry at the moment. Would you like to discuss a specific luxury timepiece or perhaps schedule a private consultation?",
+        0.3,
+        [],
+        [
+          'Which luxury watch brands interest you most?',
+          'Are you looking for a specific complication or feature?',
+          'Would you prefer to schedule a private viewing?',
+        ],
+      );
     }
   }
 
-  // Utility methods
-  getRateLimitStatus() {
-    return this.rateLimitManager.getStatus();
-  }
+  // ===== PRIVATE HELPER METHODS =====
 
-  clearCache() {
-    this.cache.clear();
-  }
+  /**
+   * Call Ollama API with proper error handling and retry logic
+   */
+  private async callOllama(
+    prompt: string,
+    options?: Partial<OllamaRequestOptions>,
+  ): Promise<string> {
+    if (!this.isOllamaAvailable) {
+      throw new Error(
+        'Ollama is not available. Please check your Ollama installation.',
+      );
+    }
 
-  // Enhanced provider switching
-  async switchProvider(newProvider: 'gemini' | 'ollama'): Promise<boolean> {
+    const requestData: OllamaRequest = {
+      model: this.ollamaModel,
+      prompt,
+      stream: false,
+      options: {
+        temperature: 0.7,
+        top_p: 0.9,
+        top_k: 40,
+        repeat_penalty: 1.1,
+        num_predict: 200,
+        ...options,
+      },
+      context: this.conversationContext,
+    };
+
     try {
-      if (newProvider === 'ollama') {
-        await this.checkOllamaHealth();
-        // Check if required models are available
-        const chatModelExists = await this.checkOllamaModelExists(
-          this.ollamaChatModel,
-        );
-        const embeddingModelExists = await this.checkOllamaModelExists(
-          this.ollamaEmbeddingModel,
-        );
+      const startTime = Date.now();
 
-        if (!chatModelExists || !embeddingModelExists) {
-          this.logger.warn('Required Ollama models not found');
-          return false;
+      const response = await firstValueFrom(
+        this.httpService.post<OllamaResponse>(
+          `${this.ollamaBaseUrl}/api/generate`,
+          requestData,
+          {
+            timeout: 30000, // 30 second timeout
+            headers: {
+              'Content-Type': 'application/json',
+            },
+          },
+        ),
+      );
+
+      const processingTime = Date.now() - startTime;
+
+      if (response.data && response.data.response) {
+        // Update conversation context for better continuity
+        if (response.data.context) {
+          this.conversationContext = response.data.context;
         }
-      } else if (newProvider === 'gemini') {
-        if (!this.geminiClient) {
-          this.logger.warn('Gemini client not available - API key missing');
-          return false;
+
+        this.logger.debug(`Ollama response generated in ${processingTime}ms`);
+        return response.data.response;
+      } else {
+        throw new Error('Invalid response from Ollama');
+      }
+    } catch (error) {
+      this.logger.error('Ollama API call failed:', error.message);
+
+      // Try to recover by checking health again
+      await this.checkOllamaHealth();
+
+      throw new Error(`Ollama API error: ${error.message}`);
+    }
+  }
+
+  /**
+   * Parse intent classification response from Ollama
+   */
+  private parseIntentResponse(
+    response: string,
+    originalQuery: string,
+  ): IntentClassification {
+    const validIntents = [
+      'PRODUCT_SEARCH',
+      'PRICE_INQUIRY',
+      'BRAND_COMPARISON',
+      'COLLECTION_INQUIRY',
+      'AUTHENTICATION',
+      'INVESTMENT_ADVICE',
+      'MAINTENANCE_SERVICE',
+      'WARRANTY_INQUIRY',
+      'AVAILABILITY',
+      'APPOINTMENT_REQUEST',
+      'GREETING',
+      'HELP_REQUEST',
+      'OTHER',
+    ];
+
+    try {
+      const lines = response.split('\n');
+      let intent = 'OTHER';
+      let confidence = 0.5;
+      let reasoning = 'AI classification';
+
+      for (const line of lines) {
+        if (line.startsWith('CATEGORY:')) {
+          const intentMatch = line
+            .replace('CATEGORY:', '')
+            .trim()
+            .toUpperCase();
+          if (validIntents.includes(intentMatch)) {
+            intent = intentMatch;
+          }
+        } else if (line.startsWith('CONFIDENCE:')) {
+          const confMatch = line.replace('CONFIDENCE:', '').trim();
+          const parsedConf = parseFloat(confMatch);
+          if (!isNaN(parsedConf) && parsedConf >= 0 && parsedConf <= 1) {
+            confidence = parsedConf;
+          }
+        } else if (line.startsWith('REASON:')) {
+          reasoning = line.replace('REASON:', '').trim();
         }
       }
 
-      return true;
+      return new IntentClassification(intent, confidence, reasoning);
     } catch (error) {
-      this.logger.error(`Failed to switch to provider ${newProvider}:`, error);
-      return false;
+      this.logger.warn('Failed to parse intent response, using fallback');
+      return this.classifyIntentFallback(originalQuery);
     }
   }
 
-  // Private utility methods
-  private isRateLimitError(error: any): boolean {
-    return (
-      error?.status === 429 ||
-      error?.message?.includes('rate limit') ||
-      error?.message?.includes('quota') ||
-      error?.message?.includes('Too Many Requests')
-    );
+  /**
+   * Parse entity extraction response from Ollama
+   */
+  private parseEntityResponse(
+    response: string,
+    originalQuery: string,
+  ): ExtractedEntity[] {
+    const entities: ExtractedEntity[] = [];
+
+    try {
+      const lines = response.split('\n');
+
+      for (const line of lines) {
+        if (line.includes('ENTITY:') && line.includes('TYPE:')) {
+          const entityMatch = line.match(
+            /ENTITY:\s*([^|]+)\s*\|\s*TYPE:\s*([^|]+)\s*\|\s*CONFIDENCE:\s*([^|]+)\s*\|\s*POSITION:\s*(\d+)/,
+          );
+
+          if (entityMatch) {
+            const [, text, type, confidenceStr, positionStr] = entityMatch;
+            const confidence = parseFloat(confidenceStr.trim());
+            const position = parseInt(positionStr.trim());
+
+            if (text && type && !isNaN(confidence) && confidence > 0.7) {
+              entities.push(
+                new ExtractedEntity(
+                  text.trim(),
+                  type.trim().toUpperCase(),
+                  confidence,
+                  position || 0,
+                  (position || 0) + text.trim().length,
+                ),
+              );
+            }
+          }
+        }
+      }
+    } catch (error) {
+      this.logger.warn('Failed to parse entity response');
+    }
+
+    return entities;
   }
 
-  private getSystemPrompt(): string {
-    return `You are a helpful e-commerce assistant. Be concise and helpful. Focus on understanding customer needs and providing relevant product recommendations.`;
+  /**
+   * Generate contextual follow-up suggestions
+   */
+  private async generateSuggestions(
+    query: string,
+    response: string,
+  ): Promise<string[]> {
+    try {
+      const prompt = `Based on this luxury watch consultation, generate 3 sophisticated follow-up questions or suggestions:
+
+Client Inquiry: "${query}"
+Our Response: "${response}"
+
+Generate 3 refined, helpful follow-up questions that would assist the client in finding the perfect timepiece. Focus on:
+- Specific watch preferences (complications, size, style)
+- Brand heritage and craftsmanship interests
+- Investment considerations and collection goals
+- Occasion or lifestyle requirements
+
+Format as numbered list:
+1. [suggestion]
+2. [suggestion] 
+3. [suggestion]`;
+
+      const suggestionResponse = await this.callOllama(prompt, {
+        temperature: 0.6,
+        num_predict: 150,
+      });
+
+      const suggestions = this.parseSuggestions(suggestionResponse);
+      return suggestions.length > 0
+        ? suggestions
+        : this.getDefaultSuggestions(query);
+    } catch (error) {
+      this.logger.warn('Failed to generate AI suggestions, using defaults');
+      return this.getDefaultSuggestions(query);
+    }
   }
 
-  private getShoppingSystemPrompt(): string {
-    return `You are an expert e-commerce shopping assistant with deep knowledge of products and customer service. Your role is to:
+  /**
+   * Parse suggestions from AI response
+   */
+  private parseSuggestions(response: string): string[] {
+    const suggestions: string[] = [];
+    const lines = response.split('\n');
 
-1. Understand customer needs and preferences
-2. Recommend the most suitable products from available inventory
-3. Provide clear explanations for your recommendations
-4. Help customers make informed purchasing decisions
-5. Offer excellent customer service
+    for (const line of lines) {
+      const match = line.match(/^\d+\.\s*(.+)$/);
+      if (match && match[1]) {
+        suggestions.push(match[1].trim());
+      }
+    }
 
-Guidelines:
-- Be friendly, professional, and helpful
-- Ask clarifying questions when needed
-- Provide specific product recommendations with reasons
-- Include pricing and key features when relevant
-- Be honest about product limitations
-- Suggest alternatives when the exact request isn't available`;
+    return suggestions.slice(0, 3); // Max 3 suggestions
   }
 
-  private getDefaultIntents(): string[] {
+  /**
+   * Get default suggestions based on query content
+   */
+  private getDefaultSuggestions(query: string): string[] {
+    const lowerQuery = query.toLowerCase();
+
+    if (lowerQuery.includes('rolex')) {
+      return [
+        'Are you interested in a specific Rolex collection like Submariner or Daytona?',
+        'Would you prefer a new piece or are you open to vintage options?',
+        'What occasions will you primarily wear this timepiece for?',
+      ];
+    }
+
+    if (lowerQuery.includes('patek') || lowerQuery.includes('philippe')) {
+      return [
+        'Are you interested in Patek Philippe complications or a time-only piece?',
+        'Would you like to explore the Calatrava or Nautilus collections?',
+        'Are you considering this as an investment or personal collection piece?',
+      ];
+    }
+
+    if (lowerQuery.includes('price') || lowerQuery.includes('investment')) {
+      return [
+        'What is your preferred investment range for this timepiece?',
+        'Are you interested in watches with strong appreciation potential?',
+        'Would you like to discuss market trends for specific brands?',
+      ];
+    }
+
     return [
-      'PRODUCT_SEARCH',
-      'PRICE_INQUIRY',
-      'RECOMMENDATION',
-      'SUPPORT',
-      'GREETING',
-      'ORDER_STATUS',
-      'COMPARISON',
-      'AVAILABILITY',
-      'OTHER',
+      'Which luxury watch brands are you most drawn to?',
+      'Are you looking for specific complications like chronograph or GMT?',
+      'Would you prefer to schedule a private consultation to view pieces?',
     ];
   }
 
-  private estimateTokenCount(text: string): number {
-    return Math.ceil(text.length / 4);
+  // Fallback methods
+  private classifyIntentFallback(query: string): IntentClassification {
+    const lowerQuery = query.toLowerCase();
+
+    if (this.containsWatchTerms(lowerQuery)) {
+      return new IntentClassification(
+        'PRODUCT_SEARCH',
+        0.8,
+        'Contains luxury watch terms',
+      );
+    }
+    if (this.containsPriceTerms(lowerQuery)) {
+      return new IntentClassification(
+        'PRICE_INQUIRY',
+        0.8,
+        'Contains price or investment terms',
+      );
+    }
+    if (this.containsBrandTerms(lowerQuery)) {
+      return new IntentClassification(
+        'BRAND_COMPARISON',
+        0.8,
+        'Contains brand comparison terms',
+      );
+    }
+    if (this.containsGreetingTerms(lowerQuery)) {
+      return new IntentClassification(
+        'GREETING',
+        0.9,
+        'Contains greeting terms',
+      );
+    }
+    if (this.containsHelpTerms(lowerQuery)) {
+      return new IntentClassification(
+        'HELP_REQUEST',
+        0.8,
+        'Contains help request terms',
+      );
+    }
+
+    return new IntentClassification('OTHER', 0.5, 'No clear pattern match');
   }
 
-  private optimizePrompt(prompt: string): string {
-    // Truncate very long prompts to save tokens
-    if (prompt.length > 1000) {
-      return prompt.substring(0, 1000) + '...';
+  private extractEntitiesFallback(query: string): ExtractedEntity[] {
+    const entities: ExtractedEntity[] = [];
+
+    // Luxury watch brands
+    const watchBrands = [
+      'rolex',
+      'patek philippe',
+      'audemars piguet',
+      'omega',
+      'cartier',
+      'breitling',
+      'tag heuer',
+      'hublot',
+      'iwc',
+      'jaeger-lecoultre',
+      'vacheron constantin',
+      'chopard',
+      'panerai',
+      'tudor',
+      'zenith',
+    ];
+    const brandRegex = new RegExp(`\\b(${watchBrands.join('|')})\\b`, 'gi');
+    let match;
+    while ((match = brandRegex.exec(query)) !== null) {
+      entities.push(
+        new ExtractedEntity(
+          match[0],
+          'WATCH_BRAND',
+          0.9,
+          match.index,
+          match.index + match[0].length,
+        ),
+      );
     }
-    return prompt;
+
+    // Price patterns for luxury watches
+    const priceRegex =
+      /\$[\d,]+k?|\$[\d,]+,[\d]+|under \$[\d,]+k?|over \$[\d,]+k?/gi;
+    while ((match = priceRegex.exec(query)) !== null) {
+      entities.push(
+        new ExtractedEntity(
+          match[0],
+          'PRICE_RANGE',
+          0.9,
+          match.index,
+          match.index + match[0].length,
+        ),
+      );
+    }
+
+    // Watch models and types
+    const watchTypes = [
+      'submariner',
+      'daytona',
+      'datejust',
+      'nautilus',
+      'royal oak',
+      'speedmaster',
+      'seamaster',
+      'tank',
+      'santos',
+      'chronograph',
+      'diving watch',
+      'dress watch',
+      'pilot watch',
+      'gmt',
+    ];
+    const typeRegex = new RegExp(`\\b(${watchTypes.join('|')})\\b`, 'gi');
+    while ((match = typeRegex.exec(query)) !== null) {
+      entities.push(
+        new ExtractedEntity(
+          match[0],
+          'WATCH_MODEL',
+          0.8,
+          match.index,
+          match.index + match[0].length,
+        ),
+      );
+    }
+
+    return entities;
   }
 
-  private getRateLimitResponse(
-    rateLimitInfo: any,
-    startTime: number,
-  ): AIResponse {
-    const waitMinutes = Math.ceil((rateLimitInfo.waitTime || 60000) / 60000);
-    const content = `I'm currently managing my response rate to provide the best service. Please wait about ${waitMinutes} minute(s) before trying again, or try a shorter, more specific question.`;
-
-    return {
-      content,
-      tokensUsed: this.estimateTokenCount(content),
-      processingTime: Date.now() - startTime,
-      model: 'rate-limited',
-      provider: 'gemini',
-      confidence: 0.5,
-    };
+  // Pattern matching helpers for luxury watches
+  private containsWatchTerms(text: string): boolean {
+    const terms = [
+      'watch',
+      'timepiece',
+      'chronometer',
+      'wristwatch',
+      'horology',
+      'movement',
+      'complication',
+      'tourbillon',
+      'perpetual calendar',
+    ];
+    return terms.some((term) => text.includes(term));
   }
 
-  private getFallbackResponse(prompt: string, startTime: number): AIResponse {
-    const processingTime = Date.now() - startTime;
-    const lowerPrompt = prompt.toLowerCase().trim();
-
-    let content =
-      "I apologize, but I'm currently experiencing technical difficulties. Please try again in a moment.";
-    let confidence = 0.5;
-
-    // Greeting patterns
-    if (this.isGreeting(lowerPrompt)) {
-      content =
-        "Hello! Welcome to our store! I'm your shopping assistant and I'm here to help you find exactly what you're looking for. How can I assist you today?";
-      confidence = 0.9;
-    }
-    // Product search patterns
-    else if (this.isProductSearch(lowerPrompt)) {
-      content =
-        "I'd be happy to help you find products! Could you please tell me more specifically what you're looking for? For example, what category, brand, or features are you interested in?";
-      confidence = 0.8;
-    }
-    // Price inquiry patterns
-    else if (this.isPriceInquiry(lowerPrompt)) {
-      content =
-        "I can help you with pricing information! Could you please specify which product you're interested in learning about?";
-      confidence = 0.8;
-    }
-    // Help/support patterns
-    else if (this.isHelpRequest(lowerPrompt)) {
-      content =
-        "I'm here to help! I can assist you with finding products, comparing options, checking prices, and answering any questions about our store. What would you like to know?";
-      confidence = 0.8;
-    }
-    // Order/shipping patterns
-    else if (this.isOrderInquiry(lowerPrompt)) {
-      content =
-        'I can help you with order-related questions! Please let me know what specific information you need about your order, shipping, or our policies.';
-      confidence = 0.8;
-    }
-    // General conversation
-    else if (this.isGeneralConversation(lowerPrompt)) {
-      content =
-        "I'm doing well, thank you for asking! I'm here to help you with your shopping needs. Is there anything specific you're looking for today?";
-      confidence = 0.8;
-    }
-
-    return {
-      content,
-      tokensUsed: this.estimateTokenCount(content),
-      processingTime,
-      model: 'intelligent-fallback',
-      provider: 'ollama',
-      confidence,
-      fromCache: false,
-    };
+  private containsPriceTerms(text: string): boolean {
+    const terms = [
+      'price',
+      'cost',
+      'expensive',
+      'investment',
+      'value',
+      'worth',
+      'budget',
+      'how much',
+      '$',
+      'appreciation',
+      'market',
+    ];
+    return terms.some((term) => text.includes(term));
   }
 
-  private isGreeting(text: string): boolean {
-    const greetingPatterns = [
+  private containsBrandTerms(text: string): boolean {
+    const terms = [
+      'compare',
+      'vs',
+      'versus',
+      'better',
+      'best',
+      'recommend',
+      'difference',
+      'between',
+      'which brand',
+      'what brand',
+    ];
+    return terms.some((term) => text.includes(term));
+  }
+
+  private containsGreetingTerms(text: string): boolean {
+    const terms = [
       'hello',
       'hi',
       'hey',
       'good morning',
       'good afternoon',
-      'good evening',
       'greetings',
-      'howdy',
-      'welcome',
-      'start',
-      'begin',
     ];
-    return greetingPatterns.some((pattern) => text.includes(pattern));
+    return terms.some((term) => text.includes(term));
   }
 
-  private isProductSearch(text: string): boolean {
-    const searchPatterns = [
-      'search',
-      'find',
-      'look for',
-      'looking for',
-      'need',
-      'want',
-      'product',
-      'item',
-      'buy',
-      'purchase',
-      'shop',
-      'shopping',
-      'browse',
-      'show me',
-    ];
-    return searchPatterns.some((pattern) => text.includes(pattern));
-  }
-  // FIX: Add simple intent classification as fallback
-  private classifyIntentSimple(
-    text: string,
-    customIntents?: string[],
-  ): IntentClassification {
-    const lowerText = text.toLowerCase();
-    let intent = 'OTHER';
-    let confidence = 0.5;
-
-    if (
-      lowerText.includes('price') ||
-      lowerText.includes('cost') ||
-      lowerText.includes('how much')
-    ) {
-      intent = 'PRICE_INQUIRY';
-      confidence = 0.8;
-    } else if (
-      lowerText.includes('search') ||
-      lowerText.includes('find') ||
-      lowerText.includes('looking for')
-    ) {
-      intent = 'PRODUCT_SEARCH';
-      confidence = 0.8;
-    } else if (
-      lowerText.includes('recommend') ||
-      lowerText.includes('suggest')
-    ) {
-      intent = 'RECOMMENDATION';
-      confidence = 0.8;
-    } else if (
-      lowerText.includes('hello') ||
-      lowerText.includes('hi') ||
-      lowerText.includes('hey')
-    ) {
-      intent = 'GREETING';
-      confidence = 0.9;
-    } else if (lowerText.includes('help') || lowerText.includes('support')) {
-      intent = 'HELP_REQUEST';
-      confidence = 0.8;
-    }
-
-    return {
-      intent,
-      confidence,
-      entities: [],
-      metadata: {
-        reasoning: 'Simple pattern matching fallback',
-        processingTime: 0,
-        originalText: text,
-      },
-    };
-  }
-  private isPriceInquiry(text: string): boolean {
-    const pricePatterns = [
-      'price',
-      'cost',
-      'expensive',
-      'cheap',
-      'budget',
-      'affordable',
-      'how much',
-      'pricing',
-      'fee',
-      'charge',
-      'rate',
-      'dollar',
-      '$',
-    ];
-    return pricePatterns.some((pattern) => text.includes(pattern));
-  }
-
-  private isHelpRequest(text: string): boolean {
-    const helpPatterns = [
+  private containsHelpTerms(text: string): boolean {
+    const terms = [
       'help',
       'assist',
       'support',
       'guide',
-      'explain',
-      'tell me',
-      'how to',
-      'can you',
-      'please',
-      'information',
-      'info',
+      'advice',
+      'consultation',
     ];
-    return helpPatterns.some((pattern) => text.includes(pattern));
+    return terms.some((term) => text.includes(term));
   }
 
-  private isOrderInquiry(text: string): boolean {
-    const orderPatterns = [
-      'order',
-      'shipping',
-      'delivery',
-      'track',
-      'status',
-      'return',
-      'refund',
-      'exchange',
-      'policy',
-      'warranty',
-      'guarantee',
-    ];
-    return orderPatterns.some((pattern) => text.includes(pattern));
-  }
-
-  private isGeneralConversation(text: string): boolean {
-    const conversationPatterns = [
-      'how are you',
-      'how do you do',
-      "what's up",
-      "how's it going",
-      'good',
-      'fine',
-      'doing',
-      'today',
-      'weather',
-      'nice',
-      'thanks',
-      'thank you',
-    ];
-    return conversationPatterns.some((pattern) => text.includes(pattern));
-  }
-
-  private isOllamaErrorResponse(content: string): boolean {
-    // FIX: More precise error detection - don't treat long valid responses as errors
-    if (!content || content.length === 0) {
+  private removeDuplicateEntities(
+    entities: ExtractedEntity[],
+  ): ExtractedEntity[] {
+    const seen = new Set();
+    return entities.filter((entity) => {
+      const key = `${entity.text.toLowerCase()}-${entity.type}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
       return true;
-    }
-
-    const lowerContent = content.toLowerCase();
-
-    // FIX: Only treat as error if it's clearly an error message, not a long response
-    if (content.length < 50) {
-      // Short responses are more likely to be errors
-      const errorPatterns = [
-        'error',
-        'failed',
-        'unable to',
-        'cannot',
-        'connection',
-        'timeout',
-        'not found',
-        '404',
-        '500',
-        'internal server error',
-        'bad request',
-        'model not found',
-      ];
-
-      return errorPatterns.some((pattern) => lowerContent.includes(pattern));
-    }
-
-    // FIX: For longer responses, only check for specific error indicators
-    const criticalErrorPatterns = [
-      'model not found',
-      'connection refused',
-      'server error',
-      'timeout error',
-    ];
-
-    return criticalErrorPatterns.some((pattern) =>
-      lowerContent.includes(pattern),
-    );
+    });
   }
 
-  private validateOllamaResponse(
-    ollamaResponse: OllamaGenerateResponse,
-  ): string | null {
-    // Check if response is complete
-    if (!ollamaResponse.done) {
-      this.logger.warn('Ollama response is not complete');
-      return null;
-    }
+  private extractProductReferences(
+    response: string,
+    productContext: string[],
+  ): string[] {
+    const references: string[] = [];
 
-    // Get and validate content
-    const content = ollamaResponse.response?.trim() || '';
+    productContext.forEach((product, index) => {
+      const productName = product.split('\n')[0];
+      if (response.toLowerCase().includes(productName.toLowerCase())) {
+        references.push(`product_${index}`);
+      }
+    });
 
-    if (!content || content.length === 0) {
-      this.logger.warn('Ollama returned empty content');
-      return null;
-    }
-
-    // FIX: Don't treat long responses as errors automatically
-    if (this.isOllamaErrorResponse(content)) {
-      this.logger.warn(`Ollama returned error response: "${content}"`);
-      return null;
-    }
-
-    return content;
+    return references;
   }
 }

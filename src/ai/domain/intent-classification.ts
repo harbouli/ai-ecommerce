@@ -1,61 +1,82 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { ExtractedEntity } from './extracted-entity';
 
 export class IntentClassification {
   @ApiProperty({
     type: String,
-    example: 'intent_123',
-    description: 'Unique identifier for the intent classification',
-  })
-  id: string;
-
-  @ApiProperty({
-    type: String,
     example: 'PRODUCT_SEARCH',
-    description: 'Classified intent category',
+    description: 'The classified intent category for the user query',
+    enum: [
+      'PRODUCT_SEARCH',
+      'PRICE_INQUIRY',
+      'COMPATIBILITY_CHECK',
+      'RECOMMENDATION',
+      'INSTALLATION_HELP',
+      'WARRANTY_INQUIRY',
+      'ORDER_STATUS',
+      'COMPARISON',
+      'AVAILABILITY',
+      'GREETING',
+      'HELP_REQUEST',
+      'OTHER',
+    ],
   })
   intent: string;
 
   @ApiProperty({
     type: Number,
     example: 0.92,
-    description: 'Confidence score for the classification (0-1)',
+    description: 'Confidence score for the intent classification',
+    minimum: 0,
+    maximum: 1,
   })
   confidence: number;
 
   @ApiProperty({
-    type: [ExtractedEntity],
-    description: 'Entities extracted from the text',
-  })
-  entities: ExtractedEntity[];
-
-  metadata: Record<string, any>;
-
-  @ApiProperty({
     type: String,
-    example: 'I need a laptop for gaming',
-    description: 'Original text that was classified',
+    example: 'User is looking for specific car parts based on keywords',
+    description: 'Brief explanation of why this intent was classified',
+    maxLength: 500,
   })
-  sourceText: string;
+  reasoning: string;
 
-  @ApiProperty({
-    type: Date,
-    example: '2023-01-01T00:00:00.000Z',
-    description: 'Creation timestamp',
-  })
-  createdAt: Date;
+  constructor(intent: string, confidence: number, reasoning: string) {
+    this.intent = intent;
+    this.confidence = confidence;
+    this.reasoning = reasoning;
+  }
 
-  @ApiProperty({
-    type: Date,
-    example: '2023-01-01T00:00:00.000Z',
-    description: 'Last update timestamp',
-  })
-  updatedAt: Date;
+  /**
+   * Check if this is a high confidence classification
+   */
+  isHighConfidence(threshold: number = 0.8): boolean {
+    return this.confidence >= threshold;
+  }
 
-  constructor() {
-    this.entities = [];
-    this.metadata = {};
-    this.createdAt = new Date();
-    this.updatedAt = new Date();
+  /**
+   * Check if this is a shopping-related intent
+   */
+  isShoppingIntent(): boolean {
+    const shoppingIntents = [
+      'PRODUCT_SEARCH',
+      'PRICE_INQUIRY',
+      'COMPATIBILITY_CHECK',
+      'RECOMMENDATION',
+      'COMPARISON',
+      'AVAILABILITY',
+    ];
+    return shoppingIntents.includes(this.intent);
+  }
+
+  /**
+   * Check if this intent requires product context
+   */
+  requiresProductContext(): boolean {
+    const contextRequiredIntents = [
+      'PRODUCT_SEARCH',
+      'RECOMMENDATION',
+      'COMPARISON',
+      'COMPATIBILITY_CHECK',
+    ];
+    return contextRequiredIntents.includes(this.intent);
   }
 }
