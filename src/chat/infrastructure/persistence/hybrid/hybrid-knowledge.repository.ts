@@ -1,4 +1,3 @@
-// src/chat/infrastructure/persistence/hybrid/hybrid-knowledge.repository.ts
 import { Injectable, Logger } from '@nestjs/common';
 import { KnowledgeEntity } from '../../../domain/knowledge';
 import { KnowledgeRepository } from '../knowledge.repository';
@@ -16,6 +15,244 @@ export class HybridKnowledgeRepository implements KnowledgeRepository {
     private readonly vectorRepository: KnowledgeVectorRepository,
     private readonly graphRepository: KnowledgeGraphRepository,
   ) {}
+  async searchProducts(
+    searchTerm: string,
+    filters?: Record<string, any>,
+  ): Promise<KnowledgeEntity[]> {
+    try {
+      this.logger.debug(`Hybrid product search for: "${searchTerm}"`);
+
+      const results: KnowledgeEntity[] = [];
+
+      // 1. Use MongoDB for traditional product search
+      const mongoResults = await this.mongoRepository.searchProducts(
+        searchTerm,
+        filters,
+      );
+      results.push(...mongoResults);
+
+      // 2. Use semantic search for better matching (RAG)
+      try {
+        const semanticResults =
+          await this.vectorRepository.semanticKnowledgeSearch(
+            `product ${searchTerm}`, // Enhance query for product context
+            10,
+          );
+
+        // Filter semantic results to only products
+        const productSemanticResults = semanticResults.filter(
+          (entity) => entity.type === 'PRODUCT',
+        );
+
+        results.push(...productSemanticResults);
+      } catch (semanticError) {
+        this.logger.warn(
+          'Semantic product search failed, using MongoDB only:',
+          semanticError,
+        );
+      }
+
+      // 3. Apply additional filters if provided
+      let filteredResults = results;
+      if (filters) {
+        filteredResults = this.applyProductFilters(results, filters);
+      }
+
+      // 4. Remove duplicates
+      const uniqueResults = this.removeDuplicates(filteredResults);
+
+      // 5. Sort by relevance (prioritize exact matches, then semantic matches)
+      const sortedResults = this.sortProductSearchResults(
+        uniqueResults,
+        searchTerm,
+      );
+
+      this.logger.debug(
+        `Hybrid product search returned ${sortedResults.length} results`,
+      );
+      return sortedResults.slice(0, 20); // Limit to top 20 results
+    } catch (error) {
+      this.logger.error('Hybrid product search failed:', error);
+      // Fallback to MongoDB only
+      return this.mongoRepository.searchProducts(searchTerm, filters);
+    }
+  }
+  private sortProductSearchResults(
+    results: KnowledgeEntity[],
+    searchTerm: string,
+  ): KnowledgeEntity[] {
+    const searchTermLower = searchTerm.toLowerCase();
+
+    return results.sort((a, b) => {
+      // 1. Prioritize exact name matches
+      const aExactMatch = a.name.toLowerCase() === searchTermLower;
+      const bExactMatch = b.name.toLowerCase() === searchTermLower;
+      if (aExactMatch && !bExactMatch) return -1;
+      if (!aExactMatch && bExactMatch) return 1;
+
+      // 2. Prioritize name starts with search term
+      const aStartsWith = a.name.toLowerCase().startsWith(searchTermLower);
+      const bStartsWith = b.name.toLowerCase().startsWith(searchTermLower);
+      if (aStartsWith && !bStartsWith) return -1;
+      if (!aStartsWith && bStartsWith) return 1;
+
+      // 3. Prioritize products with vectors (semantic search results)
+      if (a.vector && !b.vector) return -1;
+      if (!a.vector && b.vector) return 1;
+
+      // 4. Sort by rating if available
+      const aRating = a.properties?.rating || 0;
+      const bRating = b.properties?.rating || 0;
+      if (aRating !== bRating) return bRating - aRating;
+
+      // 5. Sort by name alphabetically
+      return a.name.localeCompare(b.name);
+    });
+  }
+
+  private removeDuplicates(results: KnowledgeEntity[]): KnowledgeEntity[] {
+    const seen = new Set<string>();
+    return results.filter((entity) => {
+      if (seen.has(entity.id)) {
+        return false;
+      }
+      seen.add(entity.id);
+      return true;
+    });
+  }
+
+  // ===== PRODUCT SEARCH HELPER METHODS =====
+  private applyProductFilters(
+    results: KnowledgeEntity[],
+    filters: Record<string, any>,
+  ): KnowledgeEntity[] {
+    let filtered = results;
+
+    // Apply category filter
+    if (filters.category) {
+      filtered = filtered.filter(
+        (entity) => entity.properties?.category === filters.category,
+      );
+    }
+
+    // Apply brand filter
+    if (filters.brand) {
+      filtered = filtered.filter(
+        (entity) => entity.properties?.brand === filters.brand,
+      );
+    }
+
+    // Apply price range filter
+    if (filters.minPrice !== undefined) {
+      filtered = filtered.filter(
+        (entity) =>
+          entity.properties?.price !== undefined &&
+          entity.properties.price >= filters.minPrice,
+      );
+    }
+
+    if (filters.maxPrice !== undefined) {
+      filtered = filtered.filter(
+        (entity) =>
+          entity.properties?.price !== undefined &&
+          entity.properties.price <= filters.maxPrice,
+      );
+    }
+
+    // Apply type filter (should be PRODUCT for product searches)
+    if (filters.type) {
+      filtered = filtered.filter((entity) => entity.type === filters.type);
+    }
+
+    return filtered;
+  }
+
+  async findTopProducts(
+    category?: string,
+    limit = 10,
+  ): Promise<KnowledgeEntity[]> {
+    try {
+      this.logger.debug(
+        `Finding top products${category ? ` in category: ${category}` : ''}`,
+      );
+
+      // 1. Get top products from MongoDB (primary source)
+      const mongoTopProducts = await this.mongoRepository.findTopProducts(
+        category,
+        limit * 2,
+      );
+
+      // 2. Enhance with graph relationships (KAG) - find highly connected products
+      const enhancedProducts: KnowledgeEntity[] = [];
+
+      for (const product of mongoTopProducts) {
+        try {
+          // Get relationship count as a popularity indicator
+          const relatedEntities =
+            await this.graphRepository.findRelatedEntities(product.id, 1);
+
+          // Add relationship score to the product
+          const enhancedProduct = {
+            ...product,
+            properties: {
+              ...product.properties,
+              relationshipScore: relatedEntities.length, // More relationships = more popular
+            },
+          };
+
+          enhancedProducts.push(enhancedProduct);
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        } catch (graphError) {
+          // If graph lookup fails, use original product
+          enhancedProducts.push(product);
+        }
+      }
+
+      // 3. Sort by combined score (rating + relationship score)
+      const sortedProducts = enhancedProducts.sort((a, b) => {
+        const scoreA = this.calculateProductScore(a);
+        const scoreB = this.calculateProductScore(b);
+        return scoreB - scoreA;
+      });
+
+      const topProducts = sortedProducts.slice(0, limit);
+
+      this.logger.debug(`Found ${topProducts.length} top products`);
+      return topProducts;
+    } catch (error) {
+      this.logger.error('Finding top products failed:', error);
+      // Fallback to MongoDB only
+      return this.mongoRepository.findTopProducts(category, limit);
+    }
+  }
+  private calculateProductScore(product: KnowledgeEntity): number {
+    let score = 0;
+
+    // Base score from rating
+    const rating = product.properties?.rating || 0;
+    score += rating * 2; // Rating contributes 0-10 points
+
+    // Score from sales count
+    const salesCount = product.properties?.salesCount || 0;
+    score += Math.min(salesCount / 100, 5); // Sales contribute 0-5 points
+
+    // Score from relationships (popularity in graph)
+    const relationshipScore = product.properties?.relationshipScore || 0;
+    score += Math.min(relationshipScore * 0.1, 3); // Relationships contribute 0-3 points
+
+    // Bonus for featured products
+    if (product.properties?.isFeatured) {
+      score += 2;
+    }
+
+    // Bonus for active products
+    if (product.properties?.isActive !== false) {
+      score += 1;
+    }
+
+    return score;
+  }
+
   findByProperties(
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     properties: Record<string, any>,

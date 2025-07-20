@@ -21,7 +21,6 @@ import {
   ApiParam,
   ApiBody,
 } from '@nestjs/swagger';
-import { ChatService } from './chat.service';
 import { AuthGuard } from '@nestjs/passport';
 import { CreateChatDto } from './dto/create-chat.dto';
 import { SendMessageDto } from './dto/send-message.dto';
@@ -33,7 +32,7 @@ import { AuthenticatedRequest } from './interfaces/authenticated-request.interfa
 @UseGuards(AuthGuard('jwt'))
 @UsePipes(new ValidationPipe({ transform: true, whitelist: true }))
 export class ChatController {
-  constructor(private readonly chatService: ChatService) {}
+  constructor(private readonly chatService: any) {}
 
   @Post()
   @HttpCode(HttpStatus.CREATED)

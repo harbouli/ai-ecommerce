@@ -24,6 +24,16 @@ export abstract class KnowledgeRepository {
     properties: Record<string, any>,
   ): Promise<KnowledgeEntity[]>;
 
+  // Product search methods
+  abstract searchProducts(
+    searchTerm: string,
+    filters?: Record<string, any>,
+  ): Promise<KnowledgeEntity[]>;
+  abstract findTopProducts(
+    category?: string,
+    limit?: number,
+  ): Promise<KnowledgeEntity[]>;
+
   // RAG operations - semantic search
   abstract findSimilar(
     vector: number[],

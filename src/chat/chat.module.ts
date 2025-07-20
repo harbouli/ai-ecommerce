@@ -1,8 +1,5 @@
 import { Module } from '@nestjs/common';
-import { ChatService } from './chat.service';
-import { KagService } from './services/kag.service';
-import { RagService } from './services/rag.service';
-import { ShoppingService } from './services/shopping.service';
+
 import { ChatController } from './chat.controller';
 
 import { DocumentChatPersistenceModule } from './infrastructure/persistence/document/document-persistence.module';
@@ -13,18 +10,13 @@ import { UsersModule } from '../users/users.module';
 import { ChatRepository } from './infrastructure/persistence/chat.repository';
 import { MessageRepository } from './infrastructure/persistence/message.repository';
 import { KnowledgeRepository } from './infrastructure/persistence/knowledge.repository';
-import { ProductRagService } from './services/product-rag.service';
 
 @Module({
   imports: [DocumentChatPersistenceModule, AIModule, UsersModule],
-  controllers: [ChatController],
+  controllers: [
+    // ChatController
+  ],
   providers: [
-    ChatService,
-    KagService,
-    RagService,
-    ShoppingService,
-    ProductRagService,
-
     {
       provide: ChatRepository,
       useExisting: 'DocumentChatRepository',
@@ -38,6 +30,6 @@ import { ProductRagService } from './services/product-rag.service';
       useExisting: 'DocumentKnowledgeRepository',
     },
   ],
-  exports: [ChatService, KagService, RagService, ShoppingService],
+  exports: [],
 })
 export class ChatModule {}
