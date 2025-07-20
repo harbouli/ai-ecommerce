@@ -92,10 +92,6 @@ export class AIService implements OnModuleInit {
       this.logger.log(`Analyzing query: ${query.substring(0, 100)}...`);
 
       const embedding = await this.generateEmbedding(query);
-      console.log(
-        '🚀 ~ AIService ~ analyzeQuery ~ embedding:',
-        embedding.length,
-      );
 
       // Run analysis in parallel with product search
       const [intent, entities, productContext] = await Promise.all([
@@ -133,6 +129,7 @@ export class AIService implements OnModuleInit {
       );
     }
   }
+
   /**
    * Get products directly from MongoDB to avoid UUID/ObjectId issues
    */
@@ -223,105 +220,7 @@ export class AIService implements OnModuleInit {
       throw error;
     }
   }
-  async debugEmbeddingSearch(query: string): Promise<any> {
-    try {
-      this.logger.log(`🔍 Debug: Starting embedding search for "${query}"`);
 
-      // 1. Generate embedding
-      const embedding = await this.generateEmbedding(query);
-      this.logger.log(`🔍 Generated embedding: ${embedding.length} dimensions`);
-      this.logger.log(
-        `🔍 First 5 values: [${embedding
-          .slice(0, 5)
-          .map((v) => v.toFixed(4))
-          .join(', ')}]`,
-      );
-
-      // 2. Check if products exist in Weaviate
-      const productCheck = await this.checkWeaviateProducts();
-      this.logger.log(`🔍 Weaviate status: ${JSON.stringify(productCheck)}`);
-
-      // 3. Try search with different thresholds
-      const thresholds = [0.1, 0.3, 0.5, 0.7];
-      const results: any = {};
-
-      for (const threshold of thresholds) {
-        try {
-          const searchResults = await this.productsService.semanticSearch(
-            embedding,
-            5,
-            threshold,
-          );
-          results[`threshold_${threshold}`] = {
-            count: searchResults.length,
-            products: searchResults.map((p) => ({
-              name: p.name,
-              brand: p.brand,
-            })),
-          };
-          this.logger.log(
-            `🔍 Threshold ${threshold}: ${searchResults.length} results`,
-          );
-        } catch (error) {
-          results[`threshold_${threshold}`] = { error: error.message };
-        }
-      }
-
-      // 4. Check MongoDB for comparison
-      // const mongoResults = await this.getFilteredProductsByQuery(query);
-      // this.logger.log(`🔍 MongoDB results: ${mongoResults.length} products`);
-
-      return {
-        query,
-        embedding: {
-          dimensions: embedding.length,
-          sample: embedding.slice(0, 10),
-        },
-        weaviate: productCheck,
-        searchResults: results,
-        // mongoComparison: {
-        //   count: mongoResults.length,
-        //   products: mongoResults
-        //     .slice(0, 3)
-        //     .map((p) => ({ name: p.name, brand: p.brand })),
-        // },
-      };
-    } catch (error) {
-      this.logger.error('🔍 Debug embedding search failed:', error);
-      return { error: error.message };
-    }
-  }
-
-  /**
-   * Check Weaviate products status
-   */
-  private async checkWeaviateProducts(): Promise<any> {
-    try {
-      // This would need to be added to your products service
-      const allProducts = await this.productsService.findAllWithPagination({
-        paginationOptions: { page: 1, limit: 10 },
-      });
-
-      // Check specifically for Rolex products
-      const rolexProducts = allProducts.filter(
-        (p) =>
-          p.name?.toLowerCase().includes('rolex') ||
-          p.brand?.toLowerCase().includes('rolex'),
-      );
-
-      return {
-        totalInMongo: allProducts.length,
-        rolexInMongo: rolexProducts.length,
-        sampleRolexProducts: rolexProducts.map((p) => ({
-          id: p.id,
-          name: p.name,
-          brand: p.brand,
-        })),
-      };
-    } catch (error) {
-      return { error: error.message };
-    }
-  }
   /**
    * Generate embedding using nomic-embed-text:latest via Ollama
    */
@@ -407,147 +306,6 @@ export class AIService implements OnModuleInit {
       this.logger.error('Error getting product context with embedding:', error);
       return new ProductContext([], 'embedding_search_failed', 0, 'filtered');
     }
-  }
-
-  /**
-   * Score products by relevance to query (simple and optimized)
-   */
-  private scoreProductsByRelevance(
-    query: string,
-    products: Product[],
-  ): Product[] {
-    const lowerQuery = query.toLowerCase();
-    const queryWords = lowerQuery.split(' ').filter((word) => word.length > 2);
-
-    // Add relevance score to each product
-    const scoredProducts = products.map((product) => {
-      let score = 0;
-
-      // Name matching (highest weight)
-      if (product.name) {
-        const nameLower = product.name.toLowerCase();
-        if (nameLower.includes(lowerQuery)) score += 10;
-        queryWords.forEach((word) => {
-          if (nameLower.includes(word)) score += 5;
-        });
-      }
-
-      // Description matching
-      if (product.description) {
-        const descLower = product.description.toLowerCase();
-        queryWords.forEach((word) => {
-          if (descLower.includes(word)) score += 2;
-        });
-      }
-
-      // Exact attribute matching
-      if (product.color && lowerQuery.includes(product.color.toLowerCase()))
-        score += 8;
-      if (product.size && lowerQuery.includes(product.size.toLowerCase()))
-        score += 6;
-
-      // Meta content matching
-      if (
-        product.metaTitle &&
-        product.metaTitle.toLowerCase().includes(lowerQuery)
-      )
-        score += 4;
-      if (product.metaDescription) {
-        queryWords.forEach((word) => {
-          if (product.metaDescription?.toLowerCase().includes(word)) score += 1;
-        });
-      }
-
-      return { ...product, relevanceScore: score };
-    });
-
-    // Sort by relevance score (highest first) and return top results
-    return scoredProducts
-      .filter((product) => product.relevanceScore > 0)
-      .sort((a, b) => b.relevanceScore - a.relevanceScore)
-      .slice(0, 15)
-      .map(({ relevanceScore, ...product }) => product); // Remove score from final result
-  }
-  /**
-   * Calculate advanced relevance score for product context
-   */
-  private calculateAdvancedRelevanceScore(
-    query: string,
-    products: Product[],
-  ): number {
-    if (products.length === 0) return 0;
-
-    const lowerQuery = query.toLowerCase();
-    const queryWords = lowerQuery.split(' ').filter((word) => word.length > 2);
-    let totalScore = 0;
-    let maxPossibleScore = 0;
-
-    products.forEach((product) => {
-      let productScore = 0;
-      let productMaxScore = 0;
-
-      // Name relevance (weight: 40%)
-      productMaxScore += 40;
-      if (product.name) {
-        const nameLower = product.name.toLowerCase();
-        if (nameLower === lowerQuery) productScore += 40;
-        else if (nameLower.includes(lowerQuery)) productScore += 30;
-        else {
-          const matchedWords = queryWords.filter((word) =>
-            nameLower.includes(word),
-          );
-          productScore += (matchedWords.length / queryWords.length) * 20;
-        }
-      }
-
-      // Attribute relevance (weight: 30%)
-      productMaxScore += 30;
-      let attributeScore = 0;
-      if (product.color && lowerQuery.includes(product.color.toLowerCase()))
-        attributeScore += 15;
-      if (product.size && lowerQuery.includes(product.size.toLowerCase()))
-        attributeScore += 10;
-      if (product.description) {
-        const matchedWords = queryWords.filter((word) =>
-          product.description?.toLowerCase().includes(word),
-        );
-        attributeScore += (matchedWords.length / queryWords.length) * 5;
-      }
-      productScore += Math.min(attributeScore, 30);
-
-      // Meta content relevance (weight: 20%)
-      productMaxScore += 20;
-      let metaScore = 0;
-      if (
-        product.metaTitle &&
-        product.metaTitle.toLowerCase().includes(lowerQuery)
-      )
-        metaScore += 10;
-      if (product.metaDescription) {
-        const matchedWords = queryWords.filter((word) =>
-          product.metaDescription?.toLowerCase().includes(word),
-        );
-        metaScore += (matchedWords.length / queryWords.length) * 10;
-      }
-      productScore += Math.min(metaScore, 20);
-
-      // Availability bonus (weight: 10%)
-      productMaxScore += 10;
-      if (product.isActive) productScore += 10;
-
-      totalScore += productScore;
-      maxPossibleScore += productMaxScore;
-    });
-
-    // Return normalized score (0-1)
-    const relevanceScore =
-      maxPossibleScore > 0 ? totalScore / maxPossibleScore : 0;
-
-    this.logger.log(
-      `Advanced relevance score: ${(relevanceScore * 100).toFixed(1)}% (${totalScore}/${maxPossibleScore})`,
-    );
-
-    return Math.min(relevanceScore, 1.0);
   }
 
   /**
@@ -820,13 +578,10 @@ REASON: Customer is looking for a specific watch type`;
 
       // Get store inventory context for semantic tagging
       const storeInventory = await this.getStoreInventoryContext(
-        undefined,
+        query,
         embedding,
       );
-      console.log(
-        '🚀 ~ AIService ~ extractEntities ~ storeInventory:',
-        storeInventory,
-      );
+      console.log(storeInventory);
 
       const prompt = `You are an expert at identifying all types of watches and timepieces from budget to luxury.
 
@@ -915,8 +670,10 @@ Only include entities with confidence > 0.7`;
 
       if (clientQuery) {
         // Use client's query to find relevant products via semantic search
-        const relevantProducts =
-          await this.getProductsForInventoryContext(clientQuery);
+        const relevantProducts = await this.getProductsForInventoryContext(
+          clientQuery,
+          embedding,
+        );
 
         this.logger.log(
           `Found ${relevantProducts.length} relevant products for inventory context`,
@@ -1011,25 +768,7 @@ Only include entities with confidence > 0.7`;
         products.push(...mongoProducts);
       }
 
-      // Enhanced search with query expansion (also use MongoDB-only approach)
-      const expandedQuery = this.expandQueryForInventory(clientQuery);
-      if (expandedQuery !== clientQuery) {
-        try {
-          const expandedProducts =
-            await this.getProductsDirectFromMongoDB(expandedQuery);
-          products.push(...expandedProducts);
-        } catch (error) {
-          this.logger.warn('Expanded query search failed:', error);
-        }
-      }
-
-      // Remove duplicates by ID
-      const uniqueProducts = products.filter(
-        (product, index, self) =>
-          index === self.findIndex((p) => p.id === product.id),
-      );
-
-      return uniqueProducts.filter((product) => product.isActive);
+      return products.filter((product) => product.isActive);
     } catch (error) {
       this.logger.error('Error getting products for inventory context:', error);
       // Final fallback to basic product list
@@ -1096,20 +835,6 @@ Only include entities with confidence > 0.7`;
     }
 
     return expansions.join(' ');
-  }
-
-  /**
-   * Check if we need more inventory data variety
-   */
-  private needsMoreInventoryData(
-    brands: Set<string>,
-    colors: Set<string>,
-    materials: Set<string>,
-    types: Set<string>,
-  ): boolean {
-    return (
-      brands.size < 3 || colors.size < 3 || materials.size < 3 || types.size < 2
-    );
   }
 
   /**

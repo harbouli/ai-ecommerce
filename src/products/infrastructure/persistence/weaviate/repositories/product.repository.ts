@@ -47,9 +47,9 @@ export class ProductWeaviateRepository
     const classDefinition = {
       class: this.className,
       description: 'Product information for e-commerce',
-      vectorizer: 'none', // 🔥 CHANGED: Use 'none' to allow custom embeddings
+      vectorizer: 'none',
       vectorIndexConfig: {
-        distance: 'cosine', // Better for normalized embeddings
+        distance: 'cosine',
       },
       properties: [
         {
@@ -106,6 +106,24 @@ export class ProductWeaviateRepository
           name: 'size',
           dataType: ['text'],
           description: 'Product size',
+        },
+        // 🔥 NEW: Added brand field
+        {
+          name: 'brand',
+          dataType: ['text'],
+          description: 'Product brand',
+        },
+        // 🔥 NEW: Added category field
+        {
+          name: 'category',
+          dataType: ['text'],
+          description: 'Product category',
+        },
+        // 🔥 NEW: Added tags field
+        {
+          name: 'tags',
+          dataType: ['text[]'],
+          description: 'Product tags',
         },
         {
           name: 'isActive',
@@ -210,7 +228,6 @@ export class ProductWeaviateRepository
   private async generateEmbedding(text: string): Promise<number[]> {
     try {
       if (!text || text.trim().length === 0) {
-        // Return zero vector for empty text
         return new Array(768).fill(0);
       }
 
@@ -227,7 +244,6 @@ export class ProductWeaviateRepository
 
       const embedding = response.data.embedding;
 
-      // Validate embedding dimensions
       if (!Array.isArray(embedding) || embedding.length === 0) {
         throw new Error(
           `Invalid embedding format: expected array, got ${typeof embedding}`,
@@ -240,7 +256,6 @@ export class ProductWeaviateRepository
       return embedding;
     } catch (error) {
       this.logger.error('Error generating embedding for Weaviate:', error);
-      // Return zero vector as fallback
       return new Array(768).fill(0);
     }
   }

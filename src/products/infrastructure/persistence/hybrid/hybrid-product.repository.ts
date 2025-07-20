@@ -177,45 +177,85 @@ export class HybridProductRepository implements ProductRepository {
         throw new Error('Invalid embedding: expected non-empty array');
       }
 
-      this.logger.log(
-        `Using provided embedding (${embedding.length} dimensions)`,
-      );
-
-      // Get vector search results from Weaviate using embedding
+      // Get vector search results from Weaviate
       const vectorResults = await this.weaviateRepository.semanticSearch(
         embedding,
         limit,
         threshold,
       );
 
-      console.log(
-        '🚀 ~ HybridProductRepository ~ embedding dimensions:',
-        embedding.length,
-      );
-      console.log(
-        '🚀 ~ HybridProductRepository ~ vectorResults:',
-        vectorResults,
-      );
-
-      // Fetch fresh data from MongoDB using the IDs from vector results
-      const productIds = vectorResults.map((p) => p.id);
-      if (productIds.length > 0) {
-        const mongoProducts = await this.mongoRepository.findByIds(productIds);
-
-        // Return MongoDB data in the same order as vector search results
-        return vectorResults.map(
-          (vectorProduct) =>
-            mongoProducts.find(
-              (mongoProduct) => mongoProduct.id === vectorProduct.id,
-            ) || vectorProduct,
+      if (vectorResults.length === 0) {
+        this.logger.warn(
+          `No results with threshold ${threshold}, trying adaptive search...`,
         );
+        return await this.tryAdaptiveThresholdSafe(embedding, limit, threshold);
       }
 
-      return vectorResults;
+      this.logger.log(`✅ Found ${vectorResults.length} results from Weaviate`);
+
+      return vectorResults.filter((product) => product.isActive);
     } catch (error) {
       this.logger.error('Semantic search failed:', error);
-      throw error;
+
+      // Fallback: Try adaptive threshold without MongoDB lookup
+      try {
+        return await this.tryAdaptiveThresholdSafe(embedding, limit, threshold);
+      } catch (fallbackError) {
+        this.logger.error(
+          'All semantic search attempts failed:',
+          fallbackError,
+        );
+        // Final fallback to MongoDB-only search if user has a text query available
+        return [];
+      }
     }
+  }
+
+  /**
+   * Safe adaptive threshold that doesn't try MongoDB lookup
+   */
+  private async tryAdaptiveThresholdSafe(
+    embedding: number[],
+    limit: number,
+    originalThreshold: number,
+  ): Promise<Product[]> {
+    const thresholds = [
+      originalThreshold,
+      originalThreshold * 0.7,
+      originalThreshold * 0.5,
+      0.1,
+    ];
+
+    for (const currentThreshold of thresholds) {
+      try {
+        const vectorResults = await this.weaviateRepository.semanticSearch(
+          embedding,
+          limit,
+          currentThreshold,
+        );
+
+        if (vectorResults.length > 0) {
+          this.logger.log(
+            `✅ Found ${vectorResults.length} results with threshold ${currentThreshold}`,
+          );
+
+          // Return Weaviate results directly (they're already domain objects)
+          return vectorResults.filter((product) => product.isActive);
+        }
+
+        this.logger.warn(
+          `No results with threshold ${currentThreshold}, trying lower...`,
+        );
+      } catch (error) {
+        this.logger.warn(
+          `Search failed with threshold ${currentThreshold}:`,
+          error,
+        );
+      }
+    }
+
+    this.logger.error('❌ No results found with any threshold');
+    return [];
   }
 
   async findSimilarProducts(
