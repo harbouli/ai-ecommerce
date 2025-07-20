@@ -26,7 +26,7 @@ export class AIController {
     description: 'Analyze user query for intent and entities',
   })
   @ApiBody({ type: AnalyzeQueryDto })
-  async analyzeQuery(
+  async analyzeQuerys(
     @Body(new ValidationPipe({ transform: true }))
     analyzeQueryDto: AnalyzeQueryDto,
   ) {
