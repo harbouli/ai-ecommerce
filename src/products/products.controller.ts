@@ -16,9 +16,7 @@ import { ProductsService } from './products.service';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { FindAllProductsDto } from './dto/find-all-products.dto';
-import { SemanticSearchDto } from './dto/semantic-search.dto';
 import { SimilarProductsDto } from './dto/similar-products.dto';
-import { HybridSearchDto } from './dto/hybrid-search.dto';
 import { Product } from './domain/product';
 
 @ApiTags('Products')
@@ -60,55 +58,6 @@ export class ProductsController {
         limit: query.limit ?? 10,
       },
     });
-  }
-
-  @Get('search/semantic')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({
-    summary: 'AI-powered semantic search',
-    description:
-      'Search products using natural language. Powered by Weaviate vector database for understanding context and meaning.',
-  })
-  @ApiResponse({
-    status: HttpStatus.OK,
-    description: 'Products found through AI-powered semantic search.',
-    type: [Product],
-  })
-  async semanticSearch(
-    @Query(new ValidationPipe({ transform: true })) query: SemanticSearchDto,
-  ): Promise<Product[]> {
-    return this.productsService.semanticSearch(
-      query.q,
-      query.limit,
-      query.threshold,
-    );
-  }
-
-  @Get('search/hybrid')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({
-    summary: 'Hybrid search combining AI and traditional filters',
-    description:
-      'Combines semantic search from Weaviate with traditional filters from MongoDB',
-  })
-  @ApiResponse({
-    status: HttpStatus.OK,
-    description: 'Products found through hybrid search.',
-    type: [Product],
-  })
-  async hybridSearch(
-    @Query(new ValidationPipe({ transform: true })) query: HybridSearchDto,
-  ): Promise<Product[]> {
-    return this.productsService.hybridSearch(
-      query.q,
-      {
-        minPrice: query.minPrice,
-        maxPrice: query.maxPrice,
-        category: query.category,
-        isActive: query.isActive,
-      },
-      query.limit,
-    );
   }
 
   @Get('featured')

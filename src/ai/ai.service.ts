@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-unused-vars */
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
@@ -17,6 +18,8 @@ import {
 // Import product services for semantic search
 import { ProductsService } from '../products/products.service';
 import { Product } from '../products/domain/product';
+import { StoreInventoryContext } from './dto/store-inventory-context';
+import axios from 'axios';
 
 @Injectable()
 export class AIService implements OnModuleInit {
@@ -88,11 +91,17 @@ export class AIService implements OnModuleInit {
     try {
       this.logger.log(`Analyzing query: ${query.substring(0, 100)}...`);
 
+      const embedding = await this.generateEmbedding(query);
+      console.log(
+        '🚀 ~ AIService ~ analyzeQuery ~ embedding:',
+        embedding.length,
+      );
+
       // Run analysis in parallel with product search
       const [intent, entities, productContext] = await Promise.all([
         this.classifyIntent(query),
-        this.extractEntities(query),
-        this.getProductContext(query), // New method to get relevant products
+        this.extractEntities(query, embedding),
+        this.getProductContext(embedding),
       ]);
 
       const processingTime = Date.now() - startTime;
@@ -124,111 +133,421 @@ export class AIService implements OnModuleInit {
       );
     }
   }
-
   /**
-   * Get relevant product context using semantic search
-   * @param query User's query
-   * @returns Product context with relevant watches from your store
+   * Get products directly from MongoDB to avoid UUID/ObjectId issues
    */
-  private async getProductContext(query: string): Promise<ProductContext> {
+  private async getProductsDirectFromMongoDB(
+    query: string,
+  ): Promise<Product[]> {
     try {
-      this.logger.log(`Searching products for: ${query.substring(0, 50)}...`);
+      // Use only MongoDB-based methods to avoid ID format conflicts
+      const products = await this.productsService.findAllWithPagination({
+        paginationOptions: { page: 1, limit: 50 },
+      });
 
-      // First try semantic search for natural language queries
-      let products: Product[] = [];
-      let searchMethod: 'semantic' | 'hybrid' | 'filtered' = 'semantic';
+      // Filter products based on query terms
+      const lowerQuery = query.toLowerCase();
+      const queryWords = lowerQuery
+        .split(' ')
+        .filter((word) => word.length > 2);
 
-      try {
-        // Use your existing semantic search
-        products = await this.productsService.semanticSearch(query, 10, 0.6);
-        this.logger.log(
-          `Found ${products.length} products via semantic search`,
+      const filteredProducts = products.filter((product) => {
+        if (!product.isActive) return false;
+
+        const searchableText = [
+          product.name,
+          product.description,
+          product.metaTitle,
+          product.metaDescription,
+          product.color,
+          product.size,
+          product.brand,
+          product.category,
+          ...(product.tags || []),
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+
+        // Check if any word in query matches product text
+        return queryWords.some((word) => searchableText.includes(word));
+      });
+
+      this.logger.log(
+        `MongoDB direct search found ${filteredProducts.length} products`,
+      );
+      return filteredProducts;
+    } catch (error) {
+      this.logger.error('Error in direct MongoDB search:', error);
+      return [];
+    }
+  }
+  private async callOllamaEmbedding(
+    text: string,
+  ): Promise<{ embedding: number[] }> {
+    try {
+      const url = `${this.ollamaBaseUrl}/api/embeddings`;
+
+      const response = await axios.post(
+        url,
+        {
+          model: 'nomic-embed-text:latest',
+          prompt: text,
+        },
+        {
+          timeout: 30000,
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        },
+      );
+
+      if (response.status !== 200) {
+        throw new Error(`Ollama API returned status ${response.status}`);
+      }
+
+      return response.data;
+    } catch (error) {
+      if (error.code === 'ECONNREFUSED') {
+        throw new Error(
+          'Cannot connect to Ollama. Please ensure Ollama is running.',
         );
-      } catch (_semanticError) {
-        this.logger.warn(
-          'Semantic search failed, trying hybrid search:',
-          _semanticError,
-        );
+      }
 
+      if (error.response) {
+        throw new Error(
+          `Ollama API error: ${error.response.status} - ${error.response.statusText}`,
+        );
+      }
+
+      throw error;
+    }
+  }
+  async debugEmbeddingSearch(query: string): Promise<any> {
+    try {
+      this.logger.log(`🔍 Debug: Starting embedding search for "${query}"`);
+
+      // 1. Generate embedding
+      const embedding = await this.generateEmbedding(query);
+      this.logger.log(`🔍 Generated embedding: ${embedding.length} dimensions`);
+      this.logger.log(
+        `🔍 First 5 values: [${embedding
+          .slice(0, 5)
+          .map((v) => v.toFixed(4))
+          .join(', ')}]`,
+      );
+
+      // 2. Check if products exist in Weaviate
+      const productCheck = await this.checkWeaviateProducts();
+      this.logger.log(`🔍 Weaviate status: ${JSON.stringify(productCheck)}`);
+
+      // 3. Try search with different thresholds
+      const thresholds = [0.1, 0.3, 0.5, 0.7];
+      const results: any = {};
+
+      for (const threshold of thresholds) {
         try {
-          // Fallback to hybrid search
-          products = await this.productsService.hybridSearch(query, {}, 10);
-          searchMethod = 'hybrid';
+          const searchResults = await this.productsService.semanticSearch(
+            embedding,
+            5,
+            threshold,
+          );
+          results[`threshold_${threshold}`] = {
+            count: searchResults.length,
+            products: searchResults.map((p) => ({
+              name: p.name,
+              brand: p.brand,
+            })),
+          };
           this.logger.log(
-            `Found ${products.length} products via hybrid search`,
+            `🔍 Threshold ${threshold}: ${searchResults.length} results`,
           );
-        } catch (hybridError) {
-          this.logger.warn(
-            'Hybrid search failed, using basic pagination:',
-            hybridError,
-          );
-
-          // Final fallback to basic product listing
-          products = await this.productsService.findAllWithPagination({
-            paginationOptions: { page: 1, limit: 10 },
-          });
-          searchMethod = 'filtered';
+        } catch (error) {
+          results[`threshold_${threshold}`] = { error: error.message };
         }
       }
 
-      // Filter only active products for luxury watches
-      const activeProducts = products.filter((product) => product.isActive);
+      // 4. Check MongoDB for comparison
+      // const mongoResults = await this.getFilteredProductsByQuery(query);
+      // this.logger.log(`🔍 MongoDB results: ${mongoResults.length} products`);
 
-      return new ProductContext(
-        activeProducts,
+      return {
         query,
-        this.calculateRelevanceScore(query, activeProducts),
-        searchMethod,
-      );
+        embedding: {
+          dimensions: embedding.length,
+          sample: embedding.slice(0, 10),
+        },
+        weaviate: productCheck,
+        searchResults: results,
+        // mongoComparison: {
+        //   count: mongoResults.length,
+        //   products: mongoResults
+        //     .slice(0, 3)
+        //     .map((p) => ({ name: p.name, brand: p.brand })),
+        // },
+      };
     } catch (error) {
-      this.logger.error('Error getting product context:', error);
-
-      return new ProductContext([], query, 0, 'filtered');
+      this.logger.error('🔍 Debug embedding search failed:', error);
+      return { error: error.message };
     }
   }
 
   /**
-   * Calculate relevance score based on query and found products
+   * Check Weaviate products status
    */
-  private calculateRelevanceScore(query: string, products: Product[]): number {
+  private async checkWeaviateProducts(): Promise<any> {
+    try {
+      // This would need to be added to your products service
+      const allProducts = await this.productsService.findAllWithPagination({
+        paginationOptions: { page: 1, limit: 10 },
+      });
+
+      // Check specifically for Rolex products
+      const rolexProducts = allProducts.filter(
+        (p) =>
+          p.name?.toLowerCase().includes('rolex') ||
+          p.brand?.toLowerCase().includes('rolex'),
+      );
+
+      return {
+        totalInMongo: allProducts.length,
+        rolexInMongo: rolexProducts.length,
+        sampleRolexProducts: rolexProducts.map((p) => ({
+          id: p.id,
+          name: p.name,
+          brand: p.brand,
+        })),
+      };
+    } catch (error) {
+      return { error: error.message };
+    }
+  }
+  /**
+   * Generate embedding using nomic-embed-text:latest via Ollama
+   */
+  async generateEmbedding(text: string): Promise<number[]> {
+    try {
+      this.logger.log(
+        `Generating embedding for text: "${text.substring(0, 50)}..."`,
+      );
+
+      if (!text || text.trim().length === 0) {
+        throw new Error('Text cannot be empty');
+      }
+
+      const response = await this.callOllamaEmbedding(text);
+
+      if (!response?.embedding) {
+        throw new Error('No embedding returned from Ollama');
+      }
+
+      const embedding = response.embedding;
+
+      // Validate embedding dimensions (nomic-embed-text typically returns 768 dimensions)
+      if (!Array.isArray(embedding) || embedding.length === 0) {
+        throw new Error(
+          `Invalid embedding format: expected array, got ${typeof embedding}`,
+        );
+      }
+
+      this.logger.log(
+        `Successfully generated embedding with ${embedding.length} dimensions`,
+      );
+      return embedding;
+    } catch (error) {
+      this.logger.error('Error generating embedding:', error);
+      throw new Error(`Failed to generate embedding: ${error.message}`);
+    }
+  }
+
+  /**
+   * Enhanced product context with embedding support
+   */
+  private async getProductContext(
+    embedding: number[],
+  ): Promise<ProductContext> {
+    try {
+      this.logger.log(
+        `Getting product context with embedding (${embedding.length} dimensions)`,
+      );
+
+      let products: Product[] = [];
+      let searchMethod: 'semantic' | 'hybrid' | 'filtered' = 'semantic';
+
+      try {
+        // Use semantic search with embedding
+        products = await this.productsService.semanticSearch(
+          embedding,
+          15,
+          0.5,
+        );
+        this.logger.log(
+          `Found ${products.length} products via embedding search`,
+        );
+      } catch (semanticError) {
+        this.logger.warn(
+          'Embedding search failed, using fallback:',
+          semanticError,
+        );
+        // Use fallback to empty products since we can't convert embedding back to text
+        products = [];
+        searchMethod = 'filtered';
+      }
+
+      // Filter active products and apply relevance scoring
+      const activeProducts = products.filter((product) => product.isActive);
+
+      return new ProductContext(
+        activeProducts,
+        `embedding_search_${embedding.length}d`,
+        activeProducts.length > 0 ? 0.8 : 0,
+        searchMethod,
+      );
+    } catch (error) {
+      this.logger.error('Error getting product context with embedding:', error);
+      return new ProductContext([], 'embedding_search_failed', 0, 'filtered');
+    }
+  }
+
+  /**
+   * Score products by relevance to query (simple and optimized)
+   */
+  private scoreProductsByRelevance(
+    query: string,
+    products: Product[],
+  ): Product[] {
+    const lowerQuery = query.toLowerCase();
+    const queryWords = lowerQuery.split(' ').filter((word) => word.length > 2);
+
+    // Add relevance score to each product
+    const scoredProducts = products.map((product) => {
+      let score = 0;
+
+      // Name matching (highest weight)
+      if (product.name) {
+        const nameLower = product.name.toLowerCase();
+        if (nameLower.includes(lowerQuery)) score += 10;
+        queryWords.forEach((word) => {
+          if (nameLower.includes(word)) score += 5;
+        });
+      }
+
+      // Description matching
+      if (product.description) {
+        const descLower = product.description.toLowerCase();
+        queryWords.forEach((word) => {
+          if (descLower.includes(word)) score += 2;
+        });
+      }
+
+      // Exact attribute matching
+      if (product.color && lowerQuery.includes(product.color.toLowerCase()))
+        score += 8;
+      if (product.size && lowerQuery.includes(product.size.toLowerCase()))
+        score += 6;
+
+      // Meta content matching
+      if (
+        product.metaTitle &&
+        product.metaTitle.toLowerCase().includes(lowerQuery)
+      )
+        score += 4;
+      if (product.metaDescription) {
+        queryWords.forEach((word) => {
+          if (product.metaDescription?.toLowerCase().includes(word)) score += 1;
+        });
+      }
+
+      return { ...product, relevanceScore: score };
+    });
+
+    // Sort by relevance score (highest first) and return top results
+    return scoredProducts
+      .filter((product) => product.relevanceScore > 0)
+      .sort((a, b) => b.relevanceScore - a.relevanceScore)
+      .slice(0, 15)
+      .map(({ relevanceScore, ...product }) => product); // Remove score from final result
+  }
+  /**
+   * Calculate advanced relevance score for product context
+   */
+  private calculateAdvancedRelevanceScore(
+    query: string,
+    products: Product[],
+  ): number {
     if (products.length === 0) return 0;
 
     const lowerQuery = query.toLowerCase();
+    const queryWords = lowerQuery.split(' ').filter((word) => word.length > 2);
     let totalScore = 0;
+    let maxPossibleScore = 0;
 
-    for (const product of products) {
+    products.forEach((product) => {
       let productScore = 0;
+      let productMaxScore = 0;
 
-      // Check if query terms appear in product name (highest weight)
-      if (product.name?.toLowerCase().includes(lowerQuery)) {
-        productScore += 0.4;
+      // Name relevance (weight: 40%)
+      productMaxScore += 40;
+      if (product.name) {
+        const nameLower = product.name.toLowerCase();
+        if (nameLower === lowerQuery) productScore += 40;
+        else if (nameLower.includes(lowerQuery)) productScore += 30;
+        else {
+          const matchedWords = queryWords.filter((word) =>
+            nameLower.includes(word),
+          );
+          productScore += (matchedWords.length / queryWords.length) * 20;
+        }
       }
 
-      // Check description
-      if (product.description?.toLowerCase().includes(lowerQuery)) {
-        productScore += 0.3;
+      // Attribute relevance (weight: 30%)
+      productMaxScore += 30;
+      let attributeScore = 0;
+      if (product.color && lowerQuery.includes(product.color.toLowerCase()))
+        attributeScore += 15;
+      if (product.size && lowerQuery.includes(product.size.toLowerCase()))
+        attributeScore += 10;
+      if (product.description) {
+        const matchedWords = queryWords.filter((word) =>
+          product.description?.toLowerCase().includes(word),
+        );
+        attributeScore += (matchedWords.length / queryWords.length) * 5;
       }
+      productScore += Math.min(attributeScore, 30);
 
-      // Check metadata
+      // Meta content relevance (weight: 20%)
+      productMaxScore += 20;
+      let metaScore = 0;
       if (
-        product.metaTitle?.toLowerCase().includes(lowerQuery) ||
-        product.metaDescription?.toLowerCase().includes(lowerQuery)
-      ) {
-        productScore += 0.2;
+        product.metaTitle &&
+        product.metaTitle.toLowerCase().includes(lowerQuery)
+      )
+        metaScore += 10;
+      if (product.metaDescription) {
+        const matchedWords = queryWords.filter((word) =>
+          product.metaDescription?.toLowerCase().includes(word),
+        );
+        metaScore += (matchedWords.length / queryWords.length) * 10;
       }
+      productScore += Math.min(metaScore, 20);
 
-      // Check attributes
-      if (
-        product.color?.toLowerCase().includes(lowerQuery) ||
-        product.size?.toLowerCase().includes(lowerQuery)
-      ) {
-        productScore += 0.1;
-      }
+      // Availability bonus (weight: 10%)
+      productMaxScore += 10;
+      if (product.isActive) productScore += 10;
 
       totalScore += productScore;
-    }
+      maxPossibleScore += productMaxScore;
+    });
 
-    return Math.min(totalScore / products.length, 1.0);
+    // Return normalized score (0-1)
+    const relevanceScore =
+      maxPossibleScore > 0 ? totalScore / maxPossibleScore : 0;
+
+    this.logger.log(
+      `Advanced relevance score: ${(relevanceScore * 100).toFixed(1)}% (${totalScore}/${maxPossibleScore})`,
+    );
+
+    return Math.min(relevanceScore, 1.0);
   }
 
   /**
@@ -247,9 +566,10 @@ export class AIService implements OnModuleInit {
       this.logger.log(
         `Generating luxury watch response for: ${query.substring(0, 50)}...`,
       );
+      const embedding = await this.generateEmbedding(query);
 
       // Get relevant products from your store
-      const storeProductContext = await this.getProductContext(query);
+      const storeProductContext = await this.getProductContext(embedding);
       const relevantProducts = storeProductContext.products.slice(0, 5);
 
       // Format products for AI prompt
@@ -489,45 +809,73 @@ REASON: Customer is looking for a specific watch type`;
   }
 
   /**
-   * Extract luxury watch entities
+   * Enhanced entity extraction for all types of watches with store inventory context
    */
-  async extractEntities(query: string): Promise<ExtractedEntity[]> {
+  async extractEntities(
+    query: string,
+    embedding?: number[],
+  ): Promise<ExtractedEntity[]> {
     try {
       this.logger.log(`Extracting entities from: ${query.substring(0, 50)}...`);
 
-      const prompt = `You are an expert at identifying luxury watches and horological information.
+      // Get store inventory context for semantic tagging
+      const storeInventory = await this.getStoreInventoryContext(
+        undefined,
+        embedding,
+      );
+      console.log(
+        '🚀 ~ AIService ~ extractEntities ~ storeInventory:',
+        storeInventory,
+      );
+
+      const prompt = `You are an expert at identifying all types of watches and timepieces from budget to luxury.
 
 Extract watch-related entities from this customer query and categorize them:
 
 ENTITY TYPES TO FIND:
-- WATCH_BRAND: Rolex, Patek Philippe, Audemars Piguet, Omega, Cartier, etc.
-- WATCH_MODEL: Submariner, Daytona, Nautilus, Royal Oak, Speedmaster, etc.
-- WATCH_COLLECTION: Oyster Perpetual, Aquanaut, Offshore, Seamaster, etc.
-- WATCH_TYPE: diving watch, dress watch, chronograph, GMT, pilot watch, etc.
-- PRICE_RANGE: $5000, under $50k, between $100k-500k, investment grade, etc.
-- MATERIAL: gold, platinum, titanium, ceramic, steel, rose gold, etc.
-- COMPLICATION: tourbillon, perpetual calendar, minute repeater, moon phase, etc.
-- SIZE: 40mm, 42mm, case diameter, etc.
-- CONDITION: new, vintage, pre-owned, certified pre-owned, etc.
+- WATCH_BRAND: ${storeInventory.brands.join(', ')}, and any other brands mentioned
+- WATCH_MODEL: Submariner, Daytona, Apple Watch Series 9, Garmin Fenix, etc.
+- WATCH_TYPE: smartwatch, mechanical, digital, diving, dress, sports, fitness tracker, etc.
+- WATCH_STYLE: ${storeInventory.styles.join(', ')}, casual, formal, military, etc.
+- PRICE_RANGE: under $100, $100-500, $500-1000, $1000-5000, luxury ($5000+), etc.
+- MATERIAL: ${storeInventory.materials.join(', ')}, plastic, rubber, fabric, etc.
+- COLOR: ${storeInventory.colors.join(', ')}, and any color variations
+- SIZE: ${storeInventory.sizes.join(', ')}, small, medium, large, XL, etc.
+- FEATURES: ${storeInventory.features.join(', ')}, GPS, heart rate, sleep tracking, etc.
+- CONDITION: new, used, refurbished, vintage, pre-owned, etc.
+- GENDER: men's, women's, unisex, kids, etc.
+- OCCASION: work, sport, formal, casual, outdoor, wedding, etc.
 
 Customer Query: "${query}"
+
+STORE INVENTORY CONTEXT:
+Available Brands: ${storeInventory.brands.slice(0, 10).join(', ')}
+Available Colors: ${storeInventory.colors.join(', ')}
+Available Materials: ${storeInventory.materials.join(', ')}
 
 For each entity found, respond with one line in this format:
 ENTITY: [entity_text] | TYPE: [entity_type] | CONFIDENCE: [0.0-1.0] | POSITION: [start_index]
 
 Example:
-ENTITY: Rolex Submariner | TYPE: WATCH_MODEL | CONFIDENCE: 0.95 | POSITION: 7
-ENTITY: Rolex | TYPE: WATCH_BRAND | CONFIDENCE: 0.90 | POSITION: 7
-ENTITY: $15000 | TYPE: PRICE_RANGE | CONFIDENCE: 0.85 | POSITION: 30
+ENTITY: Apple Watch | TYPE: WATCH_BRAND | CONFIDENCE: 0.95 | POSITION: 7
+ENTITY: black | TYPE: COLOR | CONFIDENCE: 0.90 | POSITION: 18
+ENTITY: fitness tracking | TYPE: FEATURES | CONFIDENCE: 0.85 | POSITION: 30
 
 Only include entities with confidence > 0.7`;
 
       const response = await this.callOllama(prompt, {
         temperature: 0.2,
-        num_predict: 300,
+        num_predict: 400,
       });
 
       const entities = this.parseEntityResponse(response);
+
+      // Add semantic inventory matching
+      const inventoryEntities = this.extractInventorySemanticTags(
+        query,
+        storeInventory,
+      );
+      entities.push(...inventoryEntities);
 
       // Add fallback entity extraction using patterns
       const fallbackEntities = this.extractEntitiesFallback(query);
@@ -544,6 +892,483 @@ Only include entities with confidence > 0.7`;
     }
   }
 
+  /**
+   * Get store inventory context based on client's query using semantic search
+   */
+  private async getStoreInventoryContext(
+    clientQuery?: string,
+    embedding?: number[],
+  ): Promise<StoreInventoryContext> {
+    try {
+      this.logger.log(
+        `Building inventory context for query: "${clientQuery || 'general'}"`,
+      );
+
+      const brands = new Set<string>();
+      const colors = new Set<string>();
+      const materials = new Set<string>();
+      const types = new Set<string>();
+      const styles = new Set<string>();
+      const features = new Set<string>();
+      const sizes = new Set<string>();
+      const priceRanges = new Set<string>();
+
+      if (clientQuery) {
+        // Use client's query to find relevant products via semantic search
+        const relevantProducts =
+          await this.getProductsForInventoryContext(clientQuery);
+
+        this.logger.log(
+          `Found ${relevantProducts.length} relevant products for inventory context`,
+        );
+
+        // Extract inventory tags from semantically relevant products
+        relevantProducts.forEach((product) => {
+          this.extractInventoryTagsFromProduct(
+            product,
+            brands,
+            colors,
+            materials,
+            types,
+            styles,
+            features,
+            sizes,
+            priceRanges,
+          );
+        });
+      } else {
+        // Fallback to general inventory sampling
+        const generalProducts =
+          await this.productsService.findAllWithPagination({
+            paginationOptions: { page: 1, limit: 100 },
+          });
+
+        generalProducts.forEach((product) => {
+          this.extractInventoryTagsFromProduct(
+            product,
+            brands,
+            colors,
+            materials,
+            types,
+            styles,
+            features,
+            sizes,
+            priceRanges,
+          );
+        });
+      }
+
+      const inventoryContext = new StoreInventoryContext(
+        Array.from(brands),
+        Array.from(colors),
+        Array.from(materials),
+        Array.from(types),
+        Array.from(priceRanges),
+        Array.from(sizes),
+        Array.from(styles),
+        Array.from(features),
+      );
+
+      return inventoryContext;
+    } catch (error) {
+      this.logger.error(
+        'Error getting query-based store inventory context:',
+        error,
+      );
+      return this.getDefaultInventoryContext();
+    }
+  }
+  /**
+   * Get products for inventory context with proper error handling
+   */
+  private async getProductsForInventoryContext(
+    clientQuery: string,
+    embedding?: number[],
+  ): Promise<Product[]> {
+    const products: Product[] = [];
+
+    try {
+      // Try semantic search first, but handle UUID/ObjectId errors gracefully
+      try {
+        const semanticProducts = await this.productsService.semanticSearch(
+          embedding ?? [],
+          15,
+          0.5,
+        );
+        products.push(...semanticProducts);
+        this.logger.log(
+          `Semantic search for inventory: ${semanticProducts.length} products`,
+        );
+      } catch (semanticError) {
+        this.logger.warn(
+          'Semantic search failed for inventory context:',
+          semanticError,
+        );
+
+        // Fallback to direct MongoDB query
+        const mongoProducts =
+          await this.getProductsDirectFromMongoDB(clientQuery);
+        products.push(...mongoProducts);
+      }
+
+      // Enhanced search with query expansion (also use MongoDB-only approach)
+      const expandedQuery = this.expandQueryForInventory(clientQuery);
+      if (expandedQuery !== clientQuery) {
+        try {
+          const expandedProducts =
+            await this.getProductsDirectFromMongoDB(expandedQuery);
+          products.push(...expandedProducts);
+        } catch (error) {
+          this.logger.warn('Expanded query search failed:', error);
+        }
+      }
+
+      // Remove duplicates by ID
+      const uniqueProducts = products.filter(
+        (product, index, self) =>
+          index === self.findIndex((p) => p.id === product.id),
+      );
+
+      return uniqueProducts.filter((product) => product.isActive);
+    } catch (error) {
+      this.logger.error('Error getting products for inventory context:', error);
+      // Final fallback to basic product list
+      return this.productsService.findAllWithPagination({
+        paginationOptions: { page: 1, limit: 20 },
+      });
+    }
+  }
+
+  /**
+   * Expand client query to include related inventory terms
+   */
+  private expandQueryForInventory(clientQuery: string): string {
+    const lowerQuery = clientQuery.toLowerCase();
+    const expansions: string[] = [clientQuery];
+
+    // Add related terms based on query content
+    if (
+      lowerQuery.includes('smart') ||
+      lowerQuery.includes('apple') ||
+      lowerQuery.includes('samsung')
+    ) {
+      expansions.push('smartwatch fitness tracker GPS bluetooth');
+    }
+
+    if (
+      lowerQuery.includes('luxury') ||
+      lowerQuery.includes('rolex') ||
+      lowerQuery.includes('omega')
+    ) {
+      expansions.push('luxury mechanical automatic gold steel premium');
+    }
+
+    if (
+      lowerQuery.includes('sport') ||
+      lowerQuery.includes('fitness') ||
+      lowerQuery.includes('running')
+    ) {
+      expansions.push('sports waterproof heart rate GPS tracking');
+    }
+
+    if (
+      lowerQuery.includes('dress') ||
+      lowerQuery.includes('formal') ||
+      lowerQuery.includes('elegant')
+    ) {
+      expansions.push('dress formal elegant leather classic');
+    }
+
+    if (
+      lowerQuery.includes('black') ||
+      lowerQuery.includes('white') ||
+      lowerQuery.includes('color')
+    ) {
+      expansions.push('black white silver gold blue red colors');
+    }
+
+    if (
+      lowerQuery.includes('cheap') ||
+      lowerQuery.includes('budget') ||
+      lowerQuery.includes('affordable')
+    ) {
+      expansions.push('affordable budget under digital quartz');
+    }
+
+    return expansions.join(' ');
+  }
+
+  /**
+   * Check if we need more inventory data variety
+   */
+  private needsMoreInventoryData(
+    brands: Set<string>,
+    colors: Set<string>,
+    materials: Set<string>,
+    types: Set<string>,
+  ): boolean {
+    return (
+      brands.size < 3 || colors.size < 3 || materials.size < 3 || types.size < 2
+    );
+  }
+
+  /**
+   * Extract all inventory tags from a single product
+   */
+  private extractInventoryTagsFromProduct(
+    product: Product,
+    brands: Set<string>,
+    colors: Set<string>,
+    materials: Set<string>,
+    types: Set<string>,
+    styles: Set<string>,
+    features: Set<string>,
+    sizes: Set<string>,
+    priceRanges: Set<string>,
+  ): void {
+    // Combine all product text
+    const productText = [
+      product.name,
+      product.description,
+      product.metaTitle,
+      product.metaDescription,
+    ]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+
+    // Direct attribute extraction
+    if (product.color) colors.add(product.color.toLowerCase());
+    if (product.size) sizes.add(product.size.toLowerCase());
+    if (product.price)
+      priceRanges.add(this.categorizePriceRange(product.price));
+
+    // Extract all categories from product text
+    this.extractInventoryTagsFromText(
+      productText,
+      brands,
+      colors,
+      materials,
+      types,
+      styles,
+      features,
+      sizes,
+    );
+  }
+
+  /**
+   * Extract semantic inventory tags using pattern matching
+   */
+  private extractInventorySemanticTags(
+    query: string,
+    inventory: StoreInventoryContext,
+  ): ExtractedEntity[] {
+    const entities: ExtractedEntity[] = [];
+    const lowerQuery = query.toLowerCase();
+
+    // Semantic brand matching
+    inventory.brands.forEach((brand) => {
+      if (lowerQuery.includes(brand.toLowerCase())) {
+        const position = lowerQuery.indexOf(brand.toLowerCase());
+        entities.push(
+          new ExtractedEntity(
+            brand,
+            'WATCH_BRAND',
+            0.9,
+            position,
+            position + brand.length,
+          ),
+        );
+      }
+    });
+
+    // Semantic color matching
+    inventory.colors.forEach((color) => {
+      if (lowerQuery.includes(color.toLowerCase())) {
+        const position = lowerQuery.indexOf(color.toLowerCase());
+        entities.push(
+          new ExtractedEntity(
+            color,
+            'COLOR',
+            0.85,
+            position,
+            position + color.length,
+          ),
+        );
+      }
+    });
+
+    // Semantic material matching
+    inventory.materials.forEach((material) => {
+      if (lowerQuery.includes(material.toLowerCase())) {
+        const position = lowerQuery.indexOf(material.toLowerCase());
+        entities.push(
+          new ExtractedEntity(
+            material,
+            'MATERIAL',
+            0.8,
+            position,
+            position + material.length,
+          ),
+        );
+      }
+    });
+
+    // Semantic feature matching
+    inventory.features.forEach((feature) => {
+      if (lowerQuery.includes(feature.toLowerCase())) {
+        const position = lowerQuery.indexOf(feature.toLowerCase());
+        entities.push(
+          new ExtractedEntity(
+            feature,
+            'FEATURES',
+            0.8,
+            position,
+            position + feature.length,
+          ),
+        );
+      }
+    });
+
+    return entities;
+  }
+  /**
+   * Extract inventory tags from text using pattern matching
+   */
+  private extractInventoryTagsFromText(
+    text: string,
+    brands: Set<string>,
+    colors: Set<string>,
+    materials: Set<string>,
+    types: Set<string>,
+    styles: Set<string>,
+    features: Set<string>,
+    sizes: Set<string>,
+  ): void {
+    const lowerText = text.toLowerCase();
+
+    // Common watch brands (all categories)
+    const brandPatterns = [
+      'apple',
+      'samsung',
+      'garmin',
+      'fitbit',
+      'rolex',
+      'omega',
+      'seiko',
+      'casio',
+      'citizen',
+      'timex',
+      'fossil',
+      'tissot',
+      'breitling',
+      'tag heuer',
+      'patek philippe',
+      'audemars piguet',
+      'vacheron constantin',
+      'cartier',
+      'rado',
+      'longines',
+    ];
+
+    // Colors
+    const colorPatterns = [
+      'black',
+      'white',
+      'silver',
+      'gold',
+      'rose gold',
+      'blue',
+      'red',
+      'green',
+      'brown',
+      'gray',
+      'grey',
+      'pink',
+      'purple',
+      'yellow',
+      'orange',
+      'bronze',
+    ];
+
+    // Materials
+    const materialPatterns = [
+      'stainless steel',
+      'titanium',
+      'aluminum',
+      'ceramic',
+      'leather',
+      'silicone',
+      'rubber',
+      'nylon',
+      'fabric',
+      'plastic',
+      'carbon fiber',
+      'sapphire',
+    ];
+
+    // Watch types
+    const typePatterns = [
+      'smartwatch',
+      'fitness tracker',
+      'mechanical',
+      'automatic',
+      'quartz',
+      'digital',
+      'analog',
+      'chronograph',
+      'diving watch',
+      'dress watch',
+      'sports watch',
+    ];
+
+    // Features
+    const featurePatterns = [
+      'gps',
+      'heart rate',
+      'sleep tracking',
+      'waterproof',
+      'bluetooth',
+      'wifi',
+      'nfc',
+      'wireless charging',
+      'voice assistant',
+      'music storage',
+      'ecg',
+    ];
+
+    brandPatterns.forEach((brand) => {
+      if (lowerText.includes(brand)) brands.add(brand);
+    });
+
+    colorPatterns.forEach((color) => {
+      if (lowerText.includes(color)) colors.add(color);
+    });
+
+    materialPatterns.forEach((material) => {
+      if (lowerText.includes(material)) materials.add(material);
+    });
+
+    typePatterns.forEach((type) => {
+      if (lowerText.includes(type)) types.add(type);
+    });
+
+    featurePatterns.forEach((feature) => {
+      if (lowerText.includes(feature)) features.add(feature);
+    });
+  }
+
+  // ===== ADD THIS NEW HELPER METHOD =====
+  /**
+   * Categorize price into ranges
+   */
+  private categorizePriceRange(price: number): string {
+    if (price < 100) return 'budget (under $100)';
+    if (price < 500) return 'affordable ($100-500)';
+    if (price < 1000) return 'mid-range ($500-1000)';
+    if (price < 5000) return 'premium ($1000-5000)';
+    return 'luxury ($5000+)';
+  }
   // ===== REST OF THE METHODS REMAIN THE SAME =====
   // (All the existing private methods like callOllama, parseIntentResponse, etc.)
 
@@ -701,7 +1526,43 @@ Only include entities with confidence > 0.7`;
 
     return entities;
   }
-
+  /**
+   * Get default inventory context as fallback
+   */
+  private getDefaultInventoryContext(): StoreInventoryContext {
+    return new StoreInventoryContext(
+      [
+        'apple',
+        'samsung',
+        'garmin',
+        'fitbit',
+        'rolex',
+        'omega',
+        'seiko',
+        'casio',
+        'fossil',
+      ],
+      ['black', 'white', 'silver', 'gold', 'blue', 'red', 'brown'],
+      ['stainless steel', 'aluminum', 'leather', 'silicone', 'ceramic'],
+      [
+        'smartwatch',
+        'fitness tracker',
+        'mechanical',
+        'digital',
+        'sports watch',
+      ],
+      [
+        'budget (under $100)',
+        'affordable ($100-500)',
+        'mid-range ($500-1000)',
+        'premium ($1000-5000)',
+        'luxury ($5000+)',
+      ],
+      ['38mm', '40mm', '42mm', '44mm', '45mm', 'small', 'medium', 'large'],
+      ['casual', 'formal', 'sport', 'luxury', 'vintage'],
+      ['gps', 'heart rate', 'waterproof', 'bluetooth', 'sleep tracking'],
+    );
+  }
   private parseSuggestions(response: string): string[] {
     const suggestions: string[] = [];
     const lines = response.split('\n');
@@ -777,37 +1638,16 @@ Only include entities with confidence > 0.7`;
     return new IntentClassification('OTHER', 0.5, 'No clear pattern match');
   }
 
+  /**
+   * Enhanced fallback entity extraction with patterns
+   */
   private extractEntitiesFallback(query: string): ExtractedEntity[] {
     const entities: ExtractedEntity[] = [];
+    const lowerQuery = query.toLowerCase();
 
-    const watchBrands = [
-      'rolex',
-      'patek philippe',
-      'audemars piguet',
-      'omega',
-      'cartier',
-      'breitling',
-      'tag heuer',
-      'hublot',
-      'iwc',
-      'jaeger-lecoultre',
-    ];
-    const brandRegex = new RegExp(`\\b(${watchBrands.join('|')})\\b`, 'gi');
+    // Price patterns
+    const priceRegex = /\$(\d+(?:,\d{3})*(?:\.\d{2})?)/g;
     let match;
-    while ((match = brandRegex.exec(query)) !== null) {
-      entities.push(
-        new ExtractedEntity(
-          match[0],
-          'WATCH_BRAND',
-          0.9,
-          match.index,
-          match.index + match[0].length,
-        ),
-      );
-    }
-
-    const priceRegex =
-      /\$[\d,]+k?|\$[\d,]+,[\d]+|under \$[\d,]+k?|over \$[\d,]+k?/gi;
     while ((match = priceRegex.exec(query)) !== null) {
       entities.push(
         new ExtractedEntity(
@@ -819,6 +1659,79 @@ Only include entities with confidence > 0.7`;
         ),
       );
     }
+
+    // Size patterns (for all watch types)
+    const sizeRegex =
+      /(\d+(?:\.\d+)?\s*mm)|(?:size\s+)?(small|medium|large|xl|xxl)/gi;
+    while ((match = sizeRegex.exec(query)) !== null) {
+      entities.push(
+        new ExtractedEntity(
+          match[0],
+          'SIZE',
+          0.85,
+          match.index,
+          match.index + match[0].length,
+        ),
+      );
+    }
+
+    // Color patterns
+    const colors = [
+      'black',
+      'white',
+      'silver',
+      'gold',
+      'blue',
+      'red',
+      'green',
+      'brown',
+      'pink',
+    ];
+    colors.forEach((color) => {
+      if (lowerQuery.includes(color)) {
+        const position = lowerQuery.indexOf(color);
+        entities.push(
+          new ExtractedEntity(
+            color,
+            'COLOR',
+            0.8,
+            position,
+            position + color.length,
+          ),
+        );
+      }
+    });
+
+    // Watch type patterns
+    const watchTypes = [
+      'smartwatch',
+      'fitness tracker',
+      'smart watch',
+      'activity tracker',
+      'mechanical watch',
+      'automatic watch',
+      'digital watch',
+      'analog watch',
+      'diving watch',
+      'dress watch',
+      'sports watch',
+      'luxury watch',
+    ];
+
+    watchTypes.forEach((type) => {
+      if (lowerQuery.includes(type)) {
+        const position = lowerQuery.indexOf(type);
+        entities.push(
+          new ExtractedEntity(
+            type,
+            'WATCH_TYPE',
+            0.85,
+            position,
+            position + type.length,
+          ),
+        );
+      }
+    });
 
     return entities;
   }

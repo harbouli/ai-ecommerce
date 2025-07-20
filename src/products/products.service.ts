@@ -77,12 +77,12 @@ export class ProductsService {
 
   // AI-powered search methods using Weaviate
   async semanticSearch(
-    query: string,
+    embedding: number[],
     limit: number = 10,
     threshold: number = 0.7,
   ): Promise<Product[]> {
-    this.logger.log(`Semantic search for: "${query}"`);
-    return this.hybridRepository.semanticSearch(query, limit, threshold);
+    this.logger.log(`Semantic search for: "${embedding.length}"`);
+    return this.hybridRepository.semanticSearch(embedding, limit, threshold);
   }
 
   async findSimilarProducts(
@@ -107,7 +107,7 @@ export class ProductsService {
   }
 
   async hybridSearch(
-    query: string,
+    embedding: number[],
     filters: {
       minPrice?: number;
       maxPrice?: number;
@@ -118,7 +118,7 @@ export class ProductsService {
   ): Promise<Product[]> {
     // 1. First, get semantic search results from Weaviate
     const vectorResults = await this.hybridRepository.semanticSearch(
-      query,
+      embedding,
       limit * 2,
       0.6,
     );

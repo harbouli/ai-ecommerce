@@ -163,22 +163,41 @@ export class HybridProductRepository implements ProductRepository {
     }
   }
 
-  // Vector search methods - delegated to Weaviate
+  /**
+   * Sync semantic search that accepts embedding array
+   */
   async semanticSearch(
-    query: string,
+    embedding: number[],
     limit: number = 10,
     threshold: number = 0.7,
   ): Promise<Product[]> {
     try {
-      // Get vector search results from Weaviate
+      // Validate embedding
+      if (!Array.isArray(embedding) || embedding.length === 0) {
+        throw new Error('Invalid embedding: expected non-empty array');
+      }
+
+      this.logger.log(
+        `Using provided embedding (${embedding.length} dimensions)`,
+      );
+
+      // Get vector search results from Weaviate using embedding
       const vectorResults = await this.weaviateRepository.semanticSearch(
-        query,
+        embedding,
         limit,
         threshold,
       );
 
-      // If you want to ensure data consistency, you can optionally
-      // fetch fresh data from MongoDB using the IDs from vector results
+      console.log(
+        '🚀 ~ HybridProductRepository ~ embedding dimensions:',
+        embedding.length,
+      );
+      console.log(
+        '🚀 ~ HybridProductRepository ~ vectorResults:',
+        vectorResults,
+      );
+
+      // Fetch fresh data from MongoDB using the IDs from vector results
       const productIds = vectorResults.map((p) => p.id);
       if (productIds.length > 0) {
         const mongoProducts = await this.mongoRepository.findByIds(productIds);
@@ -396,89 +415,5 @@ export class HybridProductRepository implements ProductRepository {
     return this.mongoRepository.findAllWithPagination({
       paginationOptions: { page: 1, limit: 100 },
     });
-  }
-
-  // Weaviate-specific methods for vector operations
-  async findProductsByVector(
-    _vector: number[],
-    limit: number = 10,
-  ): Promise<Product[]> {
-    // Direct vector search in Weaviate
-    return this.weaviateRepository.semanticSearch('', limit, 0.7);
-  }
-
-  // Enhanced hybrid search combining all three databases
-  async hybridSearch(
-    query: string,
-    filters: {
-      minPrice?: number;
-      maxPrice?: number;
-      category?: string;
-      isActive?: boolean;
-    },
-    limit: number = 10,
-  ): Promise<Product[]> {
-    try {
-      // 1. Get semantic search results from Weaviate
-      const vectorResults = await this.weaviateRepository.semanticSearch(
-        query,
-        limit * 2,
-        0.6,
-      );
-
-      // 2. If category filter is provided, also get category-based results from Neo4j
-      let categoryResults: Product[] = [];
-      if (filters.category) {
-        categoryResults = await this.graphRepository.findProductsByCategory(
-          filters.category,
-          limit,
-        );
-      }
-
-      // 3. Combine and deduplicate results
-      const combinedIds = new Set([
-        ...vectorResults.map((p) => p.id),
-        ...categoryResults.map((p) => p.id),
-      ]);
-
-      // 4. Fetch fresh data from MongoDB and apply filters
-      const mongoProducts = await this.mongoRepository.findByIds(
-        Array.from(combinedIds),
-      );
-
-      // Apply price and status filters
-      const filteredProducts = mongoProducts.filter((product) => {
-        if (filters.minPrice && product.price < filters.minPrice) return false;
-        if (filters.maxPrice && product.price > filters.maxPrice) return false;
-        if (
-          filters.isActive !== undefined &&
-          product.isActive !== filters.isActive
-        )
-          return false;
-        return true;
-      });
-
-      // Sort by relevance (maintain vector search order for the first results)
-      const vectorIds = vectorResults.map((p) => p.id);
-      filteredProducts.sort((a, b) => {
-        const aIndex = vectorIds.indexOf(a.id);
-        const bIndex = vectorIds.indexOf(b.id);
-
-        if (aIndex !== -1 && bIndex !== -1) {
-          return aIndex - bIndex;
-        }
-        if (aIndex !== -1) return -1;
-        if (bIndex !== -1) return 1;
-        return 0;
-      });
-
-      return filteredProducts.slice(0, limit);
-    } catch (error) {
-      this.logger.error('Hybrid search failed:', error);
-      // Fallback to MongoDB
-      return this.mongoRepository.findAllWithPagination({
-        paginationOptions: { page: 1, limit },
-      });
-    }
   }
 }

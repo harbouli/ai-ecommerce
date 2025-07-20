@@ -7,6 +7,7 @@ import { ProductWeaviateMapper } from '../mappers/product.mapper';
 import { NullableType } from '../../../../../utils/types/nullable.type';
 import { IPaginationOptions } from '../../../../../utils/types/pagination-options';
 import { WeaviateClient } from 'weaviate-ts-client';
+import axios from 'axios';
 
 @Injectable()
 export class ProductWeaviateRepository
@@ -46,40 +47,25 @@ export class ProductWeaviateRepository
     const classDefinition = {
       class: this.className,
       description: 'Product information for e-commerce',
-      vectorizer: 'text2vec-transformers',
+      vectorizer: 'none', // 🔥 CHANGED: Use 'none' to allow custom embeddings
+      vectorIndexConfig: {
+        distance: 'cosine', // Better for normalized embeddings
+      },
       properties: [
         {
           name: 'name',
           dataType: ['text'],
           description: 'Product name',
-          moduleConfig: {
-            'text2vec-transformers': {
-              skip: false,
-              vectorizePropertyName: false,
-            },
-          },
         },
         {
           name: 'description',
           dataType: ['text'],
           description: 'Product description',
-          moduleConfig: {
-            'text2vec-transformers': {
-              skip: false,
-              vectorizePropertyName: false,
-            },
-          },
         },
         {
           name: 'slug',
           dataType: ['text'],
           description: 'Product URL slug',
-          moduleConfig: {
-            'text2vec-transformers': {
-              skip: true,
-              vectorizePropertyName: false,
-            },
-          },
         },
         {
           name: 'price',
@@ -110,34 +96,16 @@ export class ProductWeaviateRepository
           name: 'dimensions',
           dataType: ['text'],
           description: 'Product dimensions',
-          moduleConfig: {
-            'text2vec-transformers': {
-              skip: true,
-              vectorizePropertyName: false,
-            },
-          },
         },
         {
           name: 'color',
           dataType: ['text'],
           description: 'Product color',
-          moduleConfig: {
-            'text2vec-transformers': {
-              skip: false,
-              vectorizePropertyName: false,
-            },
-          },
         },
         {
           name: 'size',
           dataType: ['text'],
           description: 'Product size',
-          moduleConfig: {
-            'text2vec-transformers': {
-              skip: false,
-              vectorizePropertyName: false,
-            },
-          },
         },
         {
           name: 'isActive',
@@ -158,23 +126,11 @@ export class ProductWeaviateRepository
           name: 'metaTitle',
           dataType: ['text'],
           description: 'Product meta title',
-          moduleConfig: {
-            'text2vec-transformers': {
-              skip: false,
-              vectorizePropertyName: false,
-            },
-          },
         },
         {
           name: 'metaDescription',
           dataType: ['text'],
           description: 'Product meta description',
-          moduleConfig: {
-            'text2vec-transformers': {
-              skip: false,
-              vectorizePropertyName: false,
-            },
-          },
         },
         {
           name: 'publishedAt',
@@ -222,14 +178,23 @@ export class ProductWeaviateRepository
         updatedAt: new Date(),
       } as Product);
 
-      // Prepare data for Weaviate (exclude vector and vectorizedText from properties)
-      const { vector, vectorizedText, id, ...weaviateProperties } =
-        persistenceModel;
+      // 🔥 GENERATE EMBEDDING FOR THE PRODUCT
+      const vectorizedText = persistenceModel.vectorizedText || '';
+      const embedding = await this.generateEmbedding(vectorizedText);
+
+      // Prepare data for Weaviate
+      const {
+        vector,
+        vectorizedText: _,
+        id,
+        ...weaviateProperties
+      } = persistenceModel;
 
       const result = await this.client.data
         .creator()
         .withClassName(this.className)
         .withProperties(weaviateProperties)
+        .withVector(embedding) // 🔥 ADD CUSTOM VECTOR
         .do();
 
       this.logger.log(`Product created in Weaviate with ID: ${result.id}`);
@@ -240,6 +205,43 @@ export class ProductWeaviateRepository
     } catch (error) {
       this.logger.error('Error creating product in Weaviate:', error);
       throw error;
+    }
+  }
+  private async generateEmbedding(text: string): Promise<number[]> {
+    try {
+      if (!text || text.trim().length === 0) {
+        // Return zero vector for empty text
+        return new Array(768).fill(0);
+      }
+
+      const ollamaUrl = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
+
+      const response = await axios.post(`${ollamaUrl}/api/embeddings`, {
+        model: 'nomic-embed-text:latest',
+        prompt: text.trim(),
+      });
+
+      if (!response.data?.embedding) {
+        throw new Error('No embedding returned from Ollama');
+      }
+
+      const embedding = response.data.embedding;
+
+      // Validate embedding dimensions
+      if (!Array.isArray(embedding) || embedding.length === 0) {
+        throw new Error(
+          `Invalid embedding format: expected array, got ${typeof embedding}`,
+        );
+      }
+
+      this.logger.debug(
+        `Generated ${embedding.length}-dimensional embedding for text: "${text.substring(0, 50)}..."`,
+      );
+      return embedding;
+    } catch (error) {
+      this.logger.error('Error generating embedding for Weaviate:', error);
+      // Return zero vector as fallback
+      return new Array(768).fill(0);
     }
   }
 
@@ -342,44 +344,51 @@ export class ProductWeaviateRepository
   async update(
     id: Product['id'],
     payload: Partial<Product>,
-  ): Promise<NullableType<Product>> {
+  ): Promise<Product | null> {
     await this.ensureClientReady();
 
     try {
-      // First check if the object exists
+      // Get existing object first
       const existingProduct = await this.findById(id);
       if (!existingProduct) {
         return null;
       }
 
-      // Update the object
+      // Merge with updates
       const updatedData = {
         ...existingProduct,
         ...payload,
         updatedAt: new Date(),
       };
-
       const persistenceModel = ProductWeaviateMapper.toPersistence(updatedData);
+
+      // 🔥 GENERATE NEW EMBEDDING
+      const vectorizedText = persistenceModel.vectorizedText || '';
+      const embedding = await this.generateEmbedding(vectorizedText);
+
+      // Prepare data for Weaviate
       const {
         vector,
-        vectorizedText,
-        id: entityId,
+        vectorizedText: _,
         ...weaviateProperties
       } = persistenceModel;
 
       await this.client.data
         .updater()
-        .withId(id)
         .withClassName(this.className)
+        .withId(id)
         .withProperties(weaviateProperties)
+        .withVector(embedding) // 🔥 UPDATE VECTOR TOO
         .do();
 
-      this.logger.log(`Product updated in Weaviate with ID: ${id}`);
+      this.logger.log(
+        `Product updated in Weaviate: ${id} (${embedding.length}D vector)`,
+      );
 
-      // Return the updated object
-      return await this.findById(id);
+      // Return updated object
+      return this.findById(id);
     } catch (error) {
-      this.logger.error(`Error updating product ${id} in Weaviate:`, error);
+      this.logger.error('Error updating product in Weaviate:', error);
       throw error;
     }
   }
@@ -401,29 +410,42 @@ export class ProductWeaviateRepository
     }
   }
 
-  // Additional vector search methods
   async semanticSearch(
-    query: string,
+    embedding: number[],
     limit: number = 10,
     threshold: number = 0.7,
   ): Promise<Product[]> {
     await this.ensureClientReady();
 
     try {
+      // Validate embedding input
+      if (!Array.isArray(embedding) || embedding.length === 0) {
+        throw new Error(
+          `Invalid embedding: expected non-empty array, got ${typeof embedding}`,
+        );
+      }
+
+      this.logger.log(
+        `Performing vector search with embedding (${embedding.length} dimensions)`,
+      );
+
       const result = await this.client.graphql
         .get()
         .withClassName(this.className)
         .withFields(
-          '_additional { id certainty } name description slug price costPrice salePrice stock weight dimensions color size isActive isFeatured isDigital metaTitle metaDescription publishedAt expiresAt createdAt updatedAt',
+          '_additional { id certainty distance } name description slug price costPrice salePrice stock weight dimensions color size isActive isFeatured isDigital metaTitle metaDescription publishedAt expiresAt createdAt updatedAt',
         )
-        .withNearText({
-          concepts: [query],
+        .withNearVector({
+          vector: embedding,
           certainty: threshold,
         })
         .withLimit(limit)
         .do();
 
       const products = result.data?.Get?.[this.className] || [];
+
+      this.logger.log(`Found ${products.length} products with vector search`);
+
       return products
         .filter((product: any) => product._additional.certainty >= threshold)
         .map((product: any) =>
@@ -433,7 +455,10 @@ export class ProductWeaviateRepository
           }),
         );
     } catch (error) {
-      this.logger.error('Error performing semantic search:', error);
+      this.logger.error(
+        'Error performing embedding-based semantic search:',
+        error,
+      );
       throw error;
     }
   }
