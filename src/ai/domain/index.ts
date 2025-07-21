@@ -1,3 +1,6 @@
+import { ExtractedEntity } from './extracted-entity';
+import { IntentClassification } from './intent-classification';
+
 export { IntentClassification } from './intent-classification';
 export { ExtractedEntity } from './extracted-entity';
 export { QueryAnalysis } from './query-analysis';
@@ -64,4 +67,30 @@ export interface OllamaModelInfo {
   families?: string[];
   parameter_size: string;
   quantization_level: string;
+}
+export interface SimpleMessage {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  timestamp?: Date;
+}
+
+export interface GenerateResponseOptions {
+  temperature?: number;
+  maxTokens?: number;
+  includeProductRecommendations?: boolean;
+  useKnowledgeGraph?: boolean;
+  useSemanticSearch?: boolean;
+  contextLimit?: number;
+}
+
+export interface EnhancedAIResponse {
+  content: string;
+  confidence: number;
+  intent?: IntentClassification;
+  entities?: ExtractedEntity[];
+  referencedProducts?: string[];
+  suggestions?: string[];
+  processingTime: number;
+  usedTechniques: ('RAG' | 'KAG' | 'semantic_search' | 'ollama_generation')[];
+  metadata?: Record<string, any>;
 }

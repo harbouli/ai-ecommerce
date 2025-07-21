@@ -1,4 +1,3 @@
-// src/ai/domain/extracted-entity.ts
 import { ApiProperty } from '@nestjs/swagger';
 
 export class ExtractedEntity {

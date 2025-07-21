@@ -10,3 +10,16 @@ export class Chat {
   updatedAt: Date;
   deletedAt?: Date;
 }
+
+export interface ChatMessage {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+}
+
+export interface AIResponse {
+  content: string;
+  tokensUsed: number;
+  processingTime: number;
+  model: string;
+  confidence?: number;
+}

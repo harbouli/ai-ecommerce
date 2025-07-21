@@ -18,6 +18,7 @@ export class KnowledgeRelationship {
     | 'BELONGS_TO'
     | 'SIMILAR_TO'
     | 'PURCHASED_WITH'
+    | 'HAS_FEATURE'
     | 'RECOMMENDED_FOR'
     | 'RELATED_TO';
   weight: number;
